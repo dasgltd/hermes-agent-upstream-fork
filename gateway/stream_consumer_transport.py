@@ -457,8 +457,35 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
+    def _is_indivisible_rich_payload(self, text: str) -> bool:
+        """True when the adapter re-renders this WHOLE payload through a wider channel
+        (Discord embeds) and it does not fit one plain text message.
+
+        Such a payload must never be sealed by a non-final lane. ``adapter.send()`` only
+        performs the rich split when the final-delivery flag is set; without it the blind
+        size split applies and the closing blocks land as 2-3 raw markdown messages. The
+        turn-final delivery then re-renders the SAME payload as embeds on a new message and
+        the raw copies stay on screen underneath - the duplicated tail reported on
+        2026-09-14 and again on 2026-09-15. Verified against the live Discord messages of
+        that turn: the raw chunks were byte-identical to ``truncate_message`` output and
+        carried the send-path suppress flag.
+        """
+        try:
+            if self._len_fn(text) <= self._safe_limit:
+                return False
+            from gateway.platforms.base import _custom_unit_to_cp
+            budget = _custom_unit_to_cp(text, self._safe_limit, self._len_fn)
+            return self._adapter_final_chunks(text, budget) == [text]
+        except Exception:  # pragma: no cover - never break delivery over styling
+            return False
+
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
+        if not finalize and self._is_indivisible_rich_payload(text):
+            # Only a final delivery can render this payload through the adapter's wider
+            # channel; sealing it here would ship it as raw chunks that the final
+            # delivery cannot reclaim. Hold it in the buffer until the turn finalizes.
+            return False
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
             # _send_draft_frame). This is where every fallback path converges,
