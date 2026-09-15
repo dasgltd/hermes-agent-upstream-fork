@@ -19,6 +19,15 @@ from typing import Dict, List, Optional
 
 from gateway.config import Platform
 from gateway.platforms.base import build_auto_tts_output_path
+
+# DASG carried patch (carry-jarvis-runpy-tts-opus, retained half). Live "**Thinking...**" checkpoint
+# block: the label line plus the contiguous ``> `` blockquote lines that carry the reasoning. Used to
+# keep auto-TTS (voice_mode="all") from narrating the checkpoints: audio speaks only the final answer.
+# (The Telegram opus-conversion half of the original carry was superseded by upstream's
+# build_auto_tts_output_path + central container repair.)
+_THINKING_BLOCK_RE = re.compile(
+    r'(?im)^[ \t]*(?:\*\*)?\s*Thinking\.\.\.\s*(?:\*\*)?[ \t]*\n(?:[ \t]*>.*(?:\n|$))*'
+)
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -322,7 +331,16 @@ class GatewayVoiceMixin:
         try:
             from tools.tts_text_normalize import _strip_markdown_for_tts
             from tools.tts_tool import text_to_speech_tool
-            tts_text = _strip_markdown_for_tts(text)
+            # DASG carried patch: speak ONLY the final answer. Drop the live "**Thinking...**" checkpoint
+            # blocks (label line + the contiguous ``> `` blockquote lines that follow) before any markdown
+            # cleanup. Without this the audio narrates every reasoning checkpoint, since _strip_markdown
+            # only turns "**Thinking...**" into "Thinking..." and never removes the block. A blank line
+            # ends a block, so real callouts (a blockquote after a gap) are preserved. Distinct from
+            # upstream's <think>...</think> stripping in tools/tts_text_normalize.py (prepare_spoken_text),
+            # which targets raw model reasoning tags, not our own rendered progress checkpoints.
+            spoken = _THINKING_BLOCK_RE.sub("", text)
+            spoken = re.sub(r"\n{3,}", "\n\n", spoken).strip()
+            tts_text = _strip_markdown_for_tts(spoken)
             if not tts_text:
                 return
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an

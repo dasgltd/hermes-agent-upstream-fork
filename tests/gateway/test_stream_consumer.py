@@ -7,7 +7,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent.think_scrubber import THINK_CLOSE_TAGS, THINK_OPEN_TAGS, THINK_TAG_NAMES
-from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.stream_consumer import (
+    GatewayStreamConsumer,
+    StreamConsumerConfig,
+    _TOOL_TRAIL,
+    _TOOL_TRAIL_FRAME_PREFIX,
+    _TOOL_TRAIL_FRAME_SUFFIX,
+)
 from gateway.stream_consumer_think import StreamThinkFilterMixin
 from hermes_cli import cli_stream_mixin
 
@@ -26,6 +32,139 @@ def test_stream_send_metadata_carries_original_reply_anchor():
         "reply_to_message_id": "456",
         "notify": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_first_bubble_consumes_reply_anchor():
+    """reply_to_mode="first" at the TURN level: adapters only apply "first" per
+    send() call, so the consumer must drop the user quote once the first bubble
+    lands or every segment/continuation send re-quotes the original message."""
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(adapter, "123", initial_reply_to_id="456")
+
+    assert await consumer._send_or_edit("first bubble") is True
+    assert adapter.send.call_args[1]["reply_to"] == "456"
+    assert consumer._initial_reply_to_id is None
+    assert consumer._metadata_for_send(final=True) == {"notify": True}
+
+
+@pytest.mark.asyncio
+async def test_persistent_reply_anchor_survives_first_bubble():
+    """Platforms whose thread semantics live in the reply reference keep it."""
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(
+        adapter, "123", initial_reply_to_id="456", anchor_reply_persistent=True)
+
+    assert await consumer._send_or_edit("first bubble") is True
+    assert consumer._initial_reply_to_id == "456"
+
+
+def test_proxy_tool_trail_is_visible_but_excluded_from_final_ledger():
+    consumer = GatewayStreamConsumer(adapter=MagicMock(), chat_id="123")
+    consumer.on_delta("Model prose before tool.")
+    frame = _TOOL_TRAIL_FRAME_PREFIX + '["\\ud83d\\udcbb terminal git status"]' + _TOOL_TRAIL_FRAME_SUFFIX
+    consumer.on_delta(frame)
+
+    assert consumer._queue.get_nowait() == "Model prose before tool."
+    marker, rendered = consumer._queue.get_nowait()
+    assert marker is _TOOL_TRAIL
+    assert rendered == "\U0001F4BB terminal git status"
+
+    consumer._append_accumulated("Model prose before tool.")
+    consumer._append_tool_trail(rendered)
+    consumer._append_accumulated(" Model prose after tool.")
+
+    assert "\U0001F4BB terminal git status" in consumer._accumulated
+    assert consumer._stream_ledger == "Model prose before tool. Model prose after tool."
+    consumer._turn_split_delivery = True
+    consumer._record_turn_final_payload(consumer._accumulated)
+    assert consumer.delivered_final_matches(
+        "Model prose before tool. Model prose after tool."
+    ) is True
+
+
+def test_fragmented_proxy_tool_trail_is_excluded_from_final_ledger():
+    consumer = GatewayStreamConsumer(adapter=MagicMock(), chat_id="123")
+    frame = _TOOL_TRAIL_FRAME_PREFIX + '["terminal npm test"]' + _TOOL_TRAIL_FRAME_SUFFIX
+
+    consumer.on_delta(frame[:9])
+    consumer.on_delta(frame[9:27])
+    consumer.on_delta(frame[27:])
+
+    marker, rendered = consumer._queue.get_nowait()
+    assert marker is _TOOL_TRAIL
+    assert rendered == "terminal npm test"
+    assert consumer._queue.empty()
+    assert consumer._stream_ledger == ""
+
+
+def test_embedded_proxy_tool_trail_is_split_out_of_prose():
+    """A single delta can carry prose + frame + prose (measured in production).
+
+    The frame must never reach the prose queue: it contaminates the final
+    ledger, which makes a complete answer look stale and triggers a duplicate
+    final send.
+    """
+    consumer = GatewayStreamConsumer(adapter=MagicMock(), chat_id="123")
+    frame = _TOOL_TRAIL_FRAME_PREFIX + '["terminal npm test"]' + _TOOL_TRAIL_FRAME_SUFFIX
+    consumer.on_delta("Answer head." + frame + "Answer tail.")
+
+    assert consumer._queue.get_nowait() == "Answer head."
+    marker, rendered = consumer._queue.get_nowait()
+    assert marker is _TOOL_TRAIL
+    assert rendered == "terminal npm test"
+    assert consumer._queue.get_nowait() == "Answer tail."
+    assert consumer._queue.empty()
+
+
+def test_partial_trail_prefix_after_prose_is_held_until_resolved():
+    """A frame split mid-prefix after prose must not leak the sentinel."""
+    consumer = GatewayStreamConsumer(adapter=MagicMock(), chat_id="123")
+    frame = _TOOL_TRAIL_FRAME_PREFIX + '["terminal ls"]' + _TOOL_TRAIL_FRAME_SUFFIX
+    consumer.on_delta("Head." + frame[:7])
+    consumer.on_delta(frame[7:] + "Tail.")
+
+    assert consumer._queue.get_nowait() == "Head."
+    marker, rendered = consumer._queue.get_nowait()
+    assert marker is _TOOL_TRAIL
+    assert rendered == "terminal ls"
+    assert consumer._queue.get_nowait() == "Tail."
+    assert consumer._queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_tool_trail_is_pushed_visibly_and_final_still_matches():
+    """End to end through run(): the trail is edited into the live message
+    (progress the user waits on), the ledger stays prose-only, and the clean
+    final_response (frames stripped at the content boundary) reconciles as
+    delivered -- no duplicate final send."""
+    adapter = MagicMock()
+    sent = []
+    adapter.send = AsyncMock(side_effect=lambda **kw: (
+        sent.append(kw["content"]), SimpleNamespace(success=True, message_id="m1"))[1])
+    adapter.edit_message = AsyncMock(side_effect=lambda **kw: (
+        sent.append(kw["content"]), SimpleNamespace(success=True))[1])
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(
+        adapter, "123", StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1, cursor=""))
+    task = asyncio.create_task(consumer.run())
+    # Sleeps exceed run()'s 0.05s loop yield so each step lands in its own tick.
+    consumer.on_delta("Answer head.")
+    await asyncio.sleep(0.1)
+    consumer.on_delta(_TOOL_TRAIL_FRAME_PREFIX + '["terminal ls"]' + _TOOL_TRAIL_FRAME_SUFFIX)
+    await asyncio.sleep(0.1)
+    consumer.on_delta(" Answer tail.")
+    consumer.finish("Answer head. Answer tail.")
+    await asyncio.wait_for(task, timeout=5)
+
+    assert any("terminal ls" in text for text in sent), sent
+    assert "\x1e" not in "".join(sent) and "\x1f" not in "".join(sent)
+    assert consumer._stream_ledger == "Answer head. Answer tail."
+    assert consumer.delivered_final_matches("Answer head. Answer tail.") is True
 
 
 # ── _clean_for_display unit tests ────────────────────────────────────────

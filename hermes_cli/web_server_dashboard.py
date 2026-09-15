@@ -25,6 +25,13 @@ def _normalise_prefix(raw: Optional[str]) -> str:
     """Normalise an X-Forwarded-Prefix header value (single source of truth lives in
     ``hermes_cli.dashboard_auth.prefix`` so gate, OAuth, cookies and SPA mount agree)."""
     from hermes_cli.dashboard_auth.prefix import normalise_prefix
+    # Carried local patch (DASG): tailscale serve proxies /hermes -> :9119 but
+    # does NOT inject X-Forwarded-Prefix, so `raw` is None and assets baked at
+    # /assets/ 404 through the proxy (blank page). Fall back to the
+    # HERMES_DASHBOARD_BASE_PATH env var when the header is absent. The header
+    # still wins when present; the same validation applies to both sources.
+    if not raw:
+        raw = os.environ.get("HERMES_DASHBOARD_BASE_PATH") or None
     return normalise_prefix(raw)
 
 

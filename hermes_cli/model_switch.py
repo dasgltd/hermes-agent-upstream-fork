@@ -1558,6 +1558,17 @@ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg:
         "default": result.new_model, "provider": result.target_provider,
         "base_url": result.base_url or None, "api_mode": result.api_mode or None,
     }
+    # DASG carried patch (2026-07-17, re-derived 2026-09-14 when upstream moved the write here from
+    # gateway/slash_commands_model.py): clearing base_url on a native-Anthropic switch wipes a
+    # loopback claude-proxy endpoint (http://127.0.0.1:11435), rerouting Claude traffic straight to
+    # api.anthropic.com where the local placeholder key 401s and every turn falls over to the Codex
+    # fallback. Keep it when the target is still anthropic and the resolver returned no endpoint;
+    # other providers must not inherit the proxy URL.
+    _prev_base_url = model_cfg.get("base_url")
+    if (not result.base_url and str(result.target_provider or "").strip().lower() == "anthropic"
+            and isinstance(_prev_base_url, str)
+            and _prev_base_url.startswith(("http://127.0.0.1", "http://localhost"))):
+        updates["base_url"] = _prev_base_url
     if "context_length" in model_cfg:
         from hermes_cli.route_identity import should_clear_context_pin
         if should_clear_context_pin(

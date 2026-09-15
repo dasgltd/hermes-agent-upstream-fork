@@ -236,6 +236,34 @@ def normalize_finish_reason(raw: Any) -> Any:
     return _FINISH_REASON_ALIASES.get(lowered, lowered)
 
 
+# Private proxy-to-gateway frame carrying rendered tool progress. The gateway
+# stream consumer renders it for display; it is display-only chrome and must
+# never survive into assistant content, final_response, or conversation
+# history. The same bytes arrive on BOTH the stream deltas and the ordinary
+# content field, so stripping it only in the stream consumer left the content
+# path contaminated -- the delivery reconciler then read a fully delivered
+# answer as stale and re-sent it (duplicate replies with the raw sentinel
+# visible to the user).
+# ADR: claude-proxy docs/decisoes/0004-tool-trail-frames-must-be-stripped-at-the-content-boundary.md
+_TOOL_TRAIL_FRAME_RE = re.compile("\x1eHERMES_TOOL_TRAIL:.*?(?:\x1f|$)", re.DOTALL)
+
+
+def strip_tool_trail_frames(text):
+    """Remove every proxy tool-trail frame from *text*.
+
+    Frames are removed wherever they appear -- start, middle, or end -- because
+    the proxy may emit prose and frame within the same content block. An
+    unterminated frame (stream truncated before the closing sentinel) is
+    dropped through end-of-text so raw sentinel bytes never reach the user.
+
+    Non-string input passes through unchanged so this is safe to drop into any
+    content boundary without type guards at the call site.
+    """
+    if not isinstance(text, str) or "\x1e" not in text:
+        return text
+    return _TOOL_TRAIL_FRAME_RE.sub("", text)
+
+
 def serialized_messages_bytes(messages: list) -> int:
     """Exact serialized byte size of ``messages`` (HTTP 413 is a BYTE-size error the token
     estimator, pricing images flat, cannot score). Non-serializable values fall back to
@@ -325,6 +353,7 @@ def _looks_like_image_content_rejection(error_body: str) -> bool:
 
 __all__ = [
     "_SURROGATE_RE", "close_interrupted_tool_sequence",
+    "strip_tool_trail_frames", "_TOOL_TRAIL_FRAME_RE",
     "_sanitize_surrogates", "_sanitize_structure_surrogates", "_sanitize_messages_surrogates",
     "_escape_invalid_chars_in_json_strings", "_repair_tool_call_arguments",
     "_strip_non_ascii", "_sanitize_messages_non_ascii", "_sanitize_tools_non_ascii",

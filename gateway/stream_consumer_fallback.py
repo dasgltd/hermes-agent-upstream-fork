@@ -31,6 +31,7 @@ class StreamFallbackMixin:
                 self._edit_supported = False
                 return reply_to_id
             self._message_id = str(result.message_id)
+            self._consume_reply_anchor()  # first bubble landed: later sends do not re-quote
             self._track_preview_ids_from_result(result)
             self._already_sent = True
             self._last_sent_text = text
@@ -61,6 +62,76 @@ class StreamFallbackMixin:
         from gateway.platforms.helpers import split_text_fence_aware
         return split_text_fence_aware(text, limit, len_fn, prefer_paragraphs=False,
                                       balance_fences=True)
+
+    def _preferred_split_index(self, text: str, budget: int) -> Optional[int]:
+        """Adapter-chosen cut point for an oversized reply, or None.
+
+        Keeps a structure the adapter renders specially (Discord's colored closing
+        blocks) inside one message. Fails open: any bad value falls back to the plain
+        last-newline split."""
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            return None
+        fn = getattr(self.adapter, "preferred_final_split_index", None)
+        if fn is None:
+            return None
+        try:
+            index = fn(text, budget)
+        except Exception as e:
+            logger.debug("preferred_final_split_index failed: %s", e)
+            return None
+        if not isinstance(index, int) or isinstance(index, bool):
+            return None
+        if 0 < index <= budget and index < len(text):
+            return index
+        return None
+
+    def _adapter_final_chunks(self, text: str, budget: int) -> Optional[list[str]]:
+        """Adapter-supplied chunking for an oversized reply, or None.
+
+        Stronger than ``_preferred_split_index``: the adapter returns the whole chunk
+        list, so a tail it re-renders through a wider channel (Discord's embeds) can
+        stay in ONE message even past the text limit. Fails open on anything that is
+        not a list of non-empty strings whose last item is a suffix of ``text`` - a
+        mangled list would silently drop delivered content."""
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            return None
+        fn = getattr(self.adapter, "preferred_final_chunks", None)
+        if fn is None:
+            return None
+        try:
+            chunks = fn(text, budget)
+        except Exception as e:
+            logger.debug("preferred_final_chunks failed: %s", e)
+            return None
+        if not isinstance(chunks, list) or not chunks:
+            return None
+        if not all(isinstance(c, str) and c.strip() for c in chunks):
+            return None
+        if not text.endswith(chunks[-1]):
+            return None
+        return chunks
+
+    def _chunks_with_boundary(self, text: str, limit: int, len_fn: "Callable[[str], int]",
+                              ) -> list[str]:
+        """Split for streaming, cutting on the adapter boundary when there is one."""
+        from gateway.platforms.base import _custom_unit_to_cp
+
+        budget = _custom_unit_to_cp(text, limit, len_fn)
+        adapter_chunks = self._adapter_final_chunks(text, budget)
+        if adapter_chunks is not None:
+            return adapter_chunks
+        index = self._preferred_split_index(text, budget)
+        if index is None:
+            return self._truncate_for_stream(text, limit, len_fn)
+        chunks: list[str] = []
+        for part in (text[:index], text[index:]):
+            if not part.strip():
+                continue
+            if len_fn(part) > limit:
+                chunks.extend(self._truncate_for_stream(part, limit, len_fn))
+            else:
+                chunks.append(part)
+        return chunks or self._truncate_for_stream(text, limit, len_fn)
 
     def _truncate_for_stream(self, text: str, limit: int, len_fn: "Callable[[str], int]",
                              ) -> list[str]:

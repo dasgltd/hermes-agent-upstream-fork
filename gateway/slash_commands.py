@@ -118,6 +118,38 @@ def _restart_notify_payload(event: MessageEvent) -> dict:
     return data
 
 
+def _under_pytest() -> bool:
+    """DASG carry: True inside a pytest run (same markers hermes_state_guard uses). Host-level side
+    effects below (arming systemd units, picking the host's safe-update script) must never fire
+    from the test sandbox: the restart/update suites call the real handlers on a real GatewayRunner."""
+    return bool(os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("PYTEST_VERSION")
+                or os.environ.get("HERMES_TEST_ISOLATION"))
+
+
+def _safe_update_script_path() -> str:
+    """DASG carry: path of the SAFE update pipeline to run instead of the builtin, or "".
+
+    The builtin ``hermes update`` is BANNED on this host: it resets main to origin/main (discarding
+    every carried patch) and its config migration drops model.base_url, which 401s Anthropic and
+    silently drops every turn to the Codex fallback (2026-07-17 incident).
+    hermes-safe-update-run.sh implements the approved pipeline: check (rebase carries in a throwaway
+    worktree + compile + validate every registry sentinel + stage on the fork) -> assisted apply
+    (snapshot tag, sentinel gate, pip, restart, health-check) with AUTOMATIC ROLLBACK. It refuses to
+    apply when the rebase is not clean. Override with HERMES_SAFE_UPDATE_SCRIPT; "off" falls back to
+    the builtin (NOT recommended on this host). Under pytest only an explicit env path is honored.
+    """
+    explicit = os.environ.get("HERMES_SAFE_UPDATE_SCRIPT")
+    if explicit is not None:
+        explicit = explicit.strip()
+        if explicit.lower() in ("", "off", "0", "none", "disabled"):
+            return ""
+        return explicit if Path(explicit).is_file() else ""
+    if _under_pytest():
+        return ""
+    default = Path.home() / ".hermes" / "scripts" / "hermes-safe-update-run.sh"
+    return str(default) if default.is_file() else ""
+
+
 def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
     setsid is portable (works where ``systemd-run --user`` lacks a D-Bus session); ``--gateway``
@@ -127,16 +159,24 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     update must replace it), redirects both outputs to one file and writes the exit code."""
     import shutil
     import subprocess
+    # DASG carry: /update runs the SAFE pipeline when present, never the builtin (see helper).
+    _safe_update_script = _safe_update_script_path()
+    if _safe_update_script:
+        logger.info("/update: using safe-update pipeline %s", _safe_update_script)
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
         subprocess.Popen(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path),
-             sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
+             *(["bash", _safe_update_script] if _safe_update_script
+               else [sys.executable, "-m", "hermes_cli.main", "update", "--gateway"])],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
-    hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
+    if _safe_update_script:
+        hermes_cmd_str = f"bash {shlex.quote(_safe_update_script)}"
+    else:
+        hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd) + " update --gateway"
     update_cmd = (
-        f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
+        f"PYTHONUNBUFFERED=1 {hermes_cmd_str}"
         f" > {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
@@ -550,6 +590,15 @@ class GatewaySlashCommandsMixin(
         # so a delayed Telegram redelivery is still detectable. Overwritten on every /restart.
         await _write_marker(".restart_last_processed.json", _dedup_payload, "dedup marker")
         active_agents = self._running_agent_count()
+        # DASG carry: /restart also cycles the claude-proxy service (and the AGY bridge).
+        # The proxy (127.0.0.1:11435) is the only bridge between Hermes and Claude; a stale
+        # proxy is the #1 cause of silent Codex fallback, so "restart everything" must mean
+        # gateway AND proxy. Fired through `systemd-run --user` so the transient unit lives
+        # OUTSIDE the gateway cgroup: a direct `systemctl restart` here would be killed
+        # mid-flight when the gateway exits (KillMode=mixed). Best-effort: never let a proxy
+        # hiccup block the gateway restart. Skipped under pytest (real handler, real host).
+        if not _under_pytest():
+            self._restart_claude_proxy_detached()
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
@@ -562,6 +611,52 @@ class GatewaySlashCommandsMixin(
         if active_agents:
             return t("gateway.draining", count=active_agents)
         return EphemeralReply(t("gateway.restart.restarting"))
+
+    def _restart_claude_proxy_detached(self) -> bool:
+        """DASG carry: schedule a detached claude-proxy.service (+ agy-bridge.service) restart.
+
+        Returns True when the transient unit was armed. Never raises: the gateway restart must
+        proceed even if the proxy cycle cannot be armed.
+        """
+        import shutil
+        import subprocess
+
+        unit = os.getenv("HERMES_PROXY_SERVICE", "claude-proxy.service")
+        if not unit or unit.lower() in ("0", "off", "none", "disabled"):
+            logger.info("/restart: claude-proxy cycle disabled via HERMES_PROXY_SERVICE")
+            return False
+        if not shutil.which("systemd-run") or not shutil.which("systemctl"):
+            logger.info("/restart: systemd-run/systemctl unavailable; skipping proxy restart")
+            return False
+
+        # Gate the proxy restart on IDLE, not on a fixed delay. A fixed `--on-active=N` starts
+        # counting when armed, so any turn longer than N seconds gets SIGTERMed mid-delivery and
+        # the reply is lost (observed 2026-07-20 09:15:12). The idle script polls claude-proxy's
+        # `claude` CLI children and only restarts once none are in flight. The AGY bridge
+        # (agy-bridge.service) rides the same idle-gated unit (carry 8c5e4bfa50).
+        idle_script = os.path.expanduser("~/.hermes/scripts/hermes-restart-when-idle.sh")
+        try:
+            if os.access(idle_script, os.X_OK):
+                cmd = [
+                    "systemd-run", "--user",
+                    f"--unit=hermes-restart-claude-proxy-{os.getpid()}", "--collect",
+                    idle_script, unit, "agy-bridge.service",
+                ]
+                mode = "idle-gated proxy + AGY bridge"
+            else:
+                logger.warning("/restart: %s missing/not executable; falling back to +3s timer", idle_script)
+                cmd = [
+                    "systemd-run", "--user", "--on-active=3",
+                    f"--unit=hermes-restart-claude-proxy-{os.getpid()}", "--collect",
+                    "systemctl", "--user", "restart", unit,
+                ]
+                mode = "fixed +3s"
+            subprocess.run(cmd, check=True, capture_output=True, timeout=15)
+            logger.info("/restart: armed detached restart of %s (%s)", unit, mode)
+            return True
+        except Exception as e:
+            logger.warning("/restart: could not arm %s restart: %s", unit, e)
+            return False
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""

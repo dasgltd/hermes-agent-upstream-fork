@@ -328,7 +328,16 @@ def _(rid, params: dict) -> dict:
                 return fail("No Hermes provider is configured.", source)
             api_key = runtime.get("api_key")
             api_key_text = "" if callable(api_key) else str(api_key or "").strip()
+            # DASG carry: the trusted loopback claude-proxy (127.0.0.1:11435) authenticates
+            # upstream itself; the placeholder key in .env is not a usable secret but the
+            # runtime is valid, so the dashboard setup must not flag it as unconfigured.
+            uses_loopback_claude_proxy = (
+                provider == "anthropic"
+                and str(runtime.get("base_url") or "").rstrip("/") == "http://127.0.0.1:11435"
+                and api_key_text == "placeholder"
+            )
             if not (callable(api_key) or api_key_text in {"aws-sdk", "no-key-required"}
+                    or uses_loopback_claude_proxy
                     or has_usable_secret(api_key_text) or bool(runtime.get("command"))):
                 return fail(f"No usable credentials found for {provider}.", runtime.get("source"))
             from hermes_cli.anon_auth import route_is_welcome_host

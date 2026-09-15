@@ -12,6 +12,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
+from agent.message_sanitization import strip_tool_trail_frames
 from agent.turn_empty_response import recover_empty_response
 from agent.turn_stop_gates import apply_stop_gates
 
@@ -184,6 +185,10 @@ def finish_text_response(
                 _frag.pop("_length_continuation_fragment", None)
                 _frag.pop("_length_continuation_nudge", None)
 
+    # final_response boundary: proxy tool-trail frames (display-only chrome) are
+    # stripped here, after continuation fragments are joined, so the delivered
+    # final text matches the frame-free stream ledger (ADR claude-proxy 0004).
+    final_response = strip_tool_trail_frames(final_response)
     final_response = agent._strip_think_blocks(final_response).strip()
 
     final_msg = agent._build_assistant_message(assistant_message, finish_reason)

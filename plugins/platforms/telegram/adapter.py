@@ -150,6 +150,28 @@ from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from utils import env_float, env_int
 
+# DASG carried patch (Daniel, 2026-07-12): the live "Thinking..." reasoning checkpoints belong on
+# Discord but NOT on Telegram. This strips the "**Thinking...**" label plus the contiguous
+# blockquote ("> ") lines that follow it. A blank line ends each block, so the "Dica do Craudinho"
+# callout and the RESULTADO/handoff blocks (which follow a gap) are preserved.
+_THINKING_BLOCK_RE = re.compile(
+    r'(?im)^[ \t]*(?:\*\*)?\s*Thinking\.\.\.\s*(?:\*\*)?[ \t]*\n(?:[ \t]*>.*(?:\n|$))*'
+)
+
+
+def _strip_thinking_checkpoints(text: str) -> str:
+    """Remove live "Thinking..." checkpoint blocks (Telegram only).
+
+    Pure pass-through when no checkpoint is present, so ordinary content reaches the Telegram API
+    byte-for-byte (upstream tests assert exact draft/rich payloads, trailing newline included)."""
+    if not text or not _THINKING_BLOCK_RE.search(text):
+        return text
+    stripped = _THINKING_BLOCK_RE.sub('', text)
+    # Collapse the blank-line runs the removal leaves behind.
+    stripped = re.sub(r'\n{3,}', '\n\n', stripped)
+    return stripped.strip()
+
+
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
 # closed with ``flood_control:{wait}`` so the caller's retry machinery owns the wait.
@@ -3448,6 +3470,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
+        # Strip the live "Thinking..." checkpoints (Telegram only; Discord keeps them). Applied here so
+        # it covers final and intermediate sends.
+        content = _strip_thinking_checkpoints(content)
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
@@ -3776,6 +3801,11 @@ class TelegramAdapter(BasePlatformAdapter):
         ``sendMessageDraft``; reusing ``draft_id`` animates the preview. The caller sends the final text."""
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+        # Strip the live "Thinking..." checkpoints from the streaming preview too, so the animated
+        # draft matches the checkpoint-free final message.
+        content = _strip_thinking_checkpoints(content)
+        if not content:
+            return SendResult(success=True, message_id=None)
         # Rich draft fast-path; any failure degrades to the plain draft below. Drafts have no message_id.
         if self._should_attempt_rich_draft(content) and await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
             return SendResult(success=True, message_id=None)

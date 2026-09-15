@@ -118,6 +118,34 @@ class StreamTransportMixin:
             except Exception as e:
                 logger.debug("%s preview cleanup failed (%s): %s", label, stale_id, e)
 
+    async def _sweep_orphan_previews(self, label: str = "Finalize") -> None:
+        """Finalize contract: no preview of THIS segment outlives the finalize that replaced it.
+
+        Only ``_send_fallback_final`` and the fresh-final lane used to clean up, so a turn that
+        finalized by EDIT (or skipped a redundant finalize) left every extra preview message of
+        the segment on screen - the user reads the tail twice, once raw and once rendered.
+
+        Segment-scoped on purpose: ``_preview_message_ids`` also holds finalized preambles from
+        earlier tool boundaries, which are delivered content, not previews.  After a split
+        (``_turn_split_delivery``) the segment's earlier ids hold SEALED HEAD CHUNKS that are
+        part of the answer, so nothing is deleted there; only a stuck cursor is stripped, so the
+        turn does not stay visibly live forever.
+        """
+        if self._turn_split_delivery:
+            cursor = getattr(self.cfg, "cursor", "") or ""
+            if cursor and (self._last_sent_text or "").endswith(cursor):
+                await self._try_strip_cursor()
+            return
+        final_id = str(self._message_id) if self._message_id else None
+        stale = {mid for mid in self._segment_preview_message_ids if mid and mid != final_id}
+        if not stale:
+            return
+        logger.debug("%s sweep: removing %d orphan preview(s) (chat=%s, turn=%s)",
+                     label, len(stale), self.chat_id, self._turn_id)
+        await self._delete_previews(stale, skip=final_id, label=label)
+        self._segment_preview_message_ids -= stale
+        self._preview_message_ids -= stale
+
     def _resolve_draft_streaming(self) -> bool:
         """cfg.transport "draft"/"auto" → the adapter's supports_draft_streaming probe
         ("draft" logs the downgrade); "edit"/"off" → False."""
@@ -286,6 +314,7 @@ class StreamTransportMixin:
         # Best-effort preview cleanup; never delete the message just sent.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
+        self._segment_preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._already_sent = True
         self._last_sent_text = text
@@ -449,6 +478,7 @@ class StreamTransportMixin:
         self._last_sent_text = text
         if result.message_id:
             self._adopt_message_id(result.message_id)
+            self._consume_reply_anchor()  # first bubble landed: later sends do not re-quote
             self._track_preview_ids_from_result(result)
         else:
             # No editable id: fallback mode + sentinel so we don't re-enter first-send.

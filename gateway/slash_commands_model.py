@@ -56,7 +56,11 @@ def _model_switch_skew_guard() -> Optional[str]:
 
 async def _persist_model_switch_to_config(result, config_path) -> None:
     """Write-through a resolved /model switch to the profile config at ``config_path``, off the
-    event loop (the route comparison can do cold-start disk I/O)."""
+    event loop (the route comparison can do cold-start disk I/O).
+
+    DASG carry NOTE: the loopback claude-proxy base_url guard used to live here; upstream moved the
+    whole write into ``hermes_cli.model_switch.model_selection_config_updates`` (Sep 2026
+    decomposition) and the guard moved with it - see the ``_prev_base_url`` carry there."""
     from hermes_cli.model_switch import persist_model_selection
     await asyncio.to_thread(persist_model_selection, result, config_path)
 
@@ -211,6 +215,16 @@ class GatewayModelCommandsMixin:
                     _sess_entry.was_auto_reset = False
                 await _sess_db.update_session_model(
                     _sess_entry.session_id, result.new_model, provider=result.target_provider,
+                )
+                # DASG carry (dd3ea3ae83): also refresh the billing route unconditionally.
+                # agent.switch_model() (run only when a cached in-memory agent exists) is the
+                # sole other writer of billing_provider/base_url; on a cold switch (idle
+                # session picked back up, no cached agent) that path never runs and the
+                # sessions row stays frozen at the session's first-ever route, so the
+                # dashboard shows e.g. "claude-sonnet-5 (openai-codex)" next to the live model.
+                await _sess_db.update_session_billing_route(
+                    _sess_entry.session_id, provider=result.target_provider,
+                    base_url=result.base_url, billing_mode=result.api_mode,
                 )
             except Exception as exc:
                 logger.debug("Failed to persist model switch to DB: %s", exc)

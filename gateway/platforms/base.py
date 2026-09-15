@@ -47,14 +47,25 @@ _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 # Telegram sendAudio accepts only MP3 / M4A; others go via sendVoice (Opus/OGG) or as a document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+# DASG carried patch: live "**Thinking...**" checkpoint blocks (label line plus the contiguous
+# blockquote ``> `` lines carrying the reasoning). The TTS normalizer only unwraps the bold, it does
+# not drop the block, so auto-TTS would narrate every checkpoint. A blank line ends the block, so
+# real blockquotes after a gap (e.g. the "Dica do Craudinho" callout) are preserved.
+_TTS_THINKING_BLOCK_RE = re.compile(
+    r'(?im)^[ \t]*(?:\*\*)?\s*Thinking\.\.\.\s*(?:\*\*)?[ \t]*\n(?:[ \t]*>.*(?:\n|$))*')
 
 
 def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
-                          output_path: "str | None" = None) -> "str | None":
+                          output_path: "str | None" = None,
+                          filter_args: "list[str] | None" = None) -> "str | None":
     """Best-effort ffmpeg transcode to Ogg/Opus (voip-tuned) for native voice bubbles: the written
     ``.ogg`` path (a NEW temp file unless ``output_path`` is given; caller cleans up), or None when
     ffmpeg is missing/fails. ``output_path`` may equal ``path`` (in-place container repair) — the
-    encode goes through a sidecar so a failed run never truncates the source. Blocking (to_thread)."""
+    encode goes through a sidecar so a failed run never truncates the source. Blocking (to_thread).
+
+    DASG carry: ``filter_args`` injects extra ffmpeg args (the Jarvis TTS FX chain) ahead of the
+    encoder. Default None keeps every non-TTS caller (Telegram/Matrix/Feishu forwarded audio)
+    byte-identical to upstream - the FX must colour only what we synthesize, never a user's file."""
     import shutil as _shutil
     ffmpeg = _shutil.which("ffmpeg")
     if not ffmpeg:
@@ -68,7 +79,7 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
     work_path = ogg_path + ".tmp.ogg" if in_place else ogg_path
     try:
         result = subprocess.run(
-            [ffmpeg, "-v", "error", "-y", "-i", str(path),
+            [ffmpeg, "-v", "error", "-y", "-i", str(path), *(filter_args or []),
              "-acodec", "libopus", "-ac", "1", "-b:a", bitrate, "-vbr", "on",
              "-application", "voip", "-compression_level", "10", "-f", "ogg", work_path],
             capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
@@ -1968,6 +1979,35 @@ class BasePlatformAdapter(ABC):
         deleting the preview) instead of final-editing it (Telegram: keeps rich rendering)."""
         return False
 
+    def preferred_final_split_index(self, text: str, budget: int) -> Optional[int]:
+        """Preferred cut point when the consumer must split an oversized reply.
+
+        Return a character offset inside ``text`` (0 < offset <= ``budget``) where the
+        split is semantically safe, or ``None`` to cut at the last line break that fits.
+        An adapter that renders part of a reply with platform-specific structure
+        (Discord turns the closing blocks into embeds) uses this so that structure is
+        never cut in half between two messages.
+        """
+        return None
+
+    def preferred_final_chunks(self, text: str, budget: int) -> Optional[List[str]]:
+        """Full chunking for an oversized reply, or ``None`` to use the default split.
+
+        Stronger than :meth:`preferred_final_split_index`, which can only move a
+        single cut and only inside ``budget``. An adapter that re-renders part of a
+        reply through a channel with its OWN size budget (Discord turns the closing
+        blocks into embeds, which allow far more than a text message) returns the
+        exact chunk list here, and the consumer sends it verbatim. That lets the
+        structured tail travel as ONE message even when it is longer than a text
+        message may be - splitting it would cut a box in half and leave the
+        already-sent halves on screen next to the re-rendered whole.
+
+        The last chunk MUST be a suffix of ``text``; the consumer drops the whole
+        list otherwise. Returning ``[text]`` means "deliver this in one message,
+        whatever its length".
+        """
+        return None
+
     def streaming_overflow_limit(self) -> Optional[int]:
         """Max single-message length (``message_len_fn`` units) the stream consumer may
         accumulate before splitting, for rich send/draft paths exceeding the legacy cap
@@ -2848,6 +2888,10 @@ class BasePlatformAdapter(ABC):
         """Chat Markdown -> transcript-like spoken script (reasoning blocks removed,
         headings/bullets flattened, units expanded). Chunking and delivery limits are the TTS tool's
         job."""
+        # DASG carried patch: drop "**Thinking...**" checkpoint blocks before normalization so the
+        # audio speaks ONLY the final answer. Horizontal-rule separators ("------") no longer need a
+        # local strip: the normalizer's _MD_HR_RE (tools.tts_text_normalize) removes them.
+        text = _TTS_THINKING_BLOCK_RE.sub('', text or '')
         try:
             from tools.tts_text_normalize import prepare_spoken_text
             return prepare_spoken_text(text, max_chars=None)

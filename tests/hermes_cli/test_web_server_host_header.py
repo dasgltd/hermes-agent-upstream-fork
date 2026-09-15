@@ -241,3 +241,71 @@ class TestWebSocketHostOriginGuard:
                 pass
 
         assert exc.value.code == 4403
+
+
+class TestExtraAllowedHosts:
+    """DASG carry: HERMES_DASHBOARD_ALLOWED_HOSTS whitelists operator-trusted
+    hostnames (Tailscale MagicDNS name / tailnet IP) for a loopback-bound
+    dashboard without a 0.0.0.0 bind and without engaging the auth gate."""
+
+    def test_env_unset_changes_nothing(self, monkeypatch):
+        from hermes_cli.web_server import _extra_allowed_hosts, _is_accepted_host
+
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+        assert _extra_allowed_hosts() == frozenset()
+        assert not _is_accepted_host("vostro.tail6de8ba.ts.net", "127.0.0.1")
+
+    def test_listed_hosts_accepted_on_loopback_bind(self, monkeypatch):
+        from hermes_cli.web_server import _extra_allowed_hosts, _is_accepted_host
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_ALLOWED_HOSTS",
+            " Vostro.tail6de8ba.ts.net , 100.85.101.119,, ",
+        )
+        assert _extra_allowed_hosts() == frozenset({"vostro.tail6de8ba.ts.net", "100.85.101.119"})
+        # Case-insensitive, with or without a port suffix.
+        assert _is_accepted_host("vostro.tail6de8ba.ts.net", "127.0.0.1")
+        assert _is_accepted_host("VOSTRO.tail6de8ba.ts.net:443", "127.0.0.1")
+        assert _is_accepted_host("100.85.101.119:9119", "127.0.0.1")
+        # Loopback aliases keep working.
+        assert _is_accepted_host("localhost:9119", "127.0.0.1")
+        # Unlisted hosts are still rejected (rebinding defence stays on).
+        assert not _is_accepted_host("evil.example", "127.0.0.1")
+        assert not _is_accepted_host("vostro.tail6de8ba.ts.net.evil.test", "127.0.0.1")
+        # Malformed authorities still fail closed.
+        assert not _is_accepted_host("http://vostro.tail6de8ba.ts.net", "127.0.0.1")
+
+    def test_allowlisted_http_request_passes_middleware(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        monkeypatch.setenv("HERMES_DASHBOARD_ALLOWED_HOSTS", "vostro.tail6de8ba.ts.net")
+        monkeypatch.setattr(app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(app.state, "trusted_public_hosts", frozenset(), raising=False)
+        client = TestClient(app)
+        resp = client.get("/api/status", headers={"Host": "vostro.tail6de8ba.ts.net"})
+        assert resp.status_code != 400
+        resp = client.get("/api/status", headers={"Host": "evil.example"})
+        assert resp.status_code == 400
+
+    def test_allowlisted_websocket_host_and_origin_are_accepted(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("HERMES_DASHBOARD_ALLOWED_HOSTS", "vostro.tail6de8ba.ts.net")
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws.app.state, "trusted_public_hosts", frozenset(), raising=False)
+        monkeypatch.setattr(ws.app.state, "auth_required", False, raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": "vostro.tail6de8ba.ts.net",
+                "Origin": "https://vostro.tail6de8ba.ts.net",
+            },
+        ):
+            pass

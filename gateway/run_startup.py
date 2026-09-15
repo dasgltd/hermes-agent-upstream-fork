@@ -490,6 +490,66 @@ class GatewayStartupMixin:
                 )
         return await self._redeliver_claimed_obligations(sendable)
 
+    def _deliverable_obligation_targets(self) -> set:
+        """``(platform, adapter_profile)`` pairs that have a connected adapter right now. Mirrors the
+        target set ``_claim_pending_obligations`` builds at boot (minus the legacy ``None`` profile,
+        which a live-owned row never has: ``record_obligation`` always stamps a profile)."""
+        _profile_adapters = getattr(self, "_profile_adapters", None) or {}
+        _pval = lambda p: getattr(p, "value", str(p))  # noqa: E731
+        targets = {(_pval(p), "default") for p in self.adapters}
+        for _profile, _adapters in _profile_adapters.items():
+            targets.update((_pval(p), _profile) for p in _adapters)
+        return targets
+
+    async def _retry_failed_obligations(self) -> int:
+        """Retry final responses THIS live process failed to deliver (DASG carry, 2026-08-21).
+
+        Closes the gap the two upstream paths leave open: ``_redeliver_pending_obligations`` only
+        claims rows whose owner is DEAD (crash recovery) and
+        ``_redeliver_failed_obligations_for_platform`` only replays reconnect / flood refusals. A
+        plain platform rejection (a Discord 5xx blip on the final send) left the row
+        ``failed``/attempts=0 while the gateway stayed up owning it: observed 2026-08-21 as thread
+        1539072364405330062 showing a stale progress card for ~2h with the completed answer stranded
+        in the ledger. Backoff and the attempts cap live in the ledger (``sweep_retryable``); this
+        only sends, through the shared redelivery contract. Nothing to clear in the session store: a
+        retry row belongs to a turn that completed and merely failed to send, so it never went
+        ``resume_pending``.
+        """
+        try:
+            from gateway.delivery_ledger import ledger_enabled, retry_sweep_enabled, sweep_retryable
+            if not await asyncio.to_thread(ledger_enabled) or not await asyncio.to_thread(retry_sweep_enabled):
+                return 0
+            targets = self._deliverable_obligation_targets()
+            claimed = await asyncio.to_thread(
+                sweep_retryable, None,
+                deliverable_platforms={platform for platform, _ in targets}, deliverable_targets=targets,
+            )
+        except Exception:
+            logger.debug("delivery ledger retry sweep failed", exc_info=True)
+            return 0
+        if not claimed:
+            return 0
+        return await self._redeliver_claimed_obligations(claimed)
+
+    async def _delivery_retry_watcher(self, interval: float = 30.0) -> None:
+        """Periodically retry obligations this process failed to deliver (DASG carry). A permanent
+        supervised watcher: the sweep is one indexed SELECT over a table capped at 500 rows and
+        almost always returns nothing, so a short interval costs little; the real pacing is the
+        per-row backoff in ``sweep_retryable``."""
+        await asyncio.sleep(min(interval, 30.0))  # let startup settle
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                if not self._running:
+                    return
+                sent = await self._retry_failed_obligations()
+                if sent:
+                    logger.info("delivery retry sweep: redelivered %d obligation(s)", sent)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a watcher must never die on one bad pass
+                logger.debug("delivery retry watcher pass failed", exc_info=True)
+
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
         """Snapshot resume-pending entries (optionally scoped to ``platform``); None when
         enumeration failed or the restart-loop breaker tripped for this boot."""
@@ -1350,8 +1410,11 @@ class GatewayStartupMixin:
         "_session_housekeeping_watcher", "_model_catalog_refresh_watcher", "_session_stall_watcher",
         "_kanban_notifier_watcher", "_kanban_dispatcher_watcher",
     )
+    # DASG carry: ``_delivery_retry_watcher`` arms the live-process retry sweep so a transient platform
+    # rejection (Discord 5xx) self-heals instead of stranding the answer until the next restart.
     _POST_RECONNECT_WATCHERS = (
         "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
+        "_delivery_retry_watcher",
     )
 
     def _start_spawn_background_watchers(self) -> None:

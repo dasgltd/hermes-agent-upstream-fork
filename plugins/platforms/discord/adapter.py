@@ -1100,6 +1100,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Reply threading mode: "off", "first" (default; first chunk only), "all" (every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        # DASG carried patch: suppress auto-generated link-preview embeds on outgoing text
+        # (SUPPRESS_EMBEDS flag). Rich UI embeds (model picker, approvals) go out via ``embed=``
+        # on separate messages and are unaffected. Default on: link-preview cards hurt
+        # readability in task/project threads.
+        self._suppress_link_previews: bool = bool(
+            self.config.extra.get("suppress_link_previews", True)
+        )
+        # DASG carried patch: render the two closing blocks of a finished reply (the RESULT block
+        # and the handoff block) as colored embeds on their own messages. They cannot ride on the
+        # main message: SUPPRESS_EMBEDS hides every embed, rich ones included, and the streamed
+        # message needs that flag to keep link previews out. Default on; false = plain text.
+        self._rich_result_embeds: bool = bool(
+            self.config.extra.get("rich_result_embeds", True)
+        )
         # Bot's last message ID per channel: lets history backfill skip the full channel.history() scan.
         self._last_self_message_id: Dict[str, str] = {}
         # Bot-authored lifecycle/status message IDs that must not bound history after restart.
@@ -2925,6 +2939,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
                 return await self._record_response_async(reply_to, result, content, final_delivery)
+            # Rich closing blocks (non-streamed final delivery): the text keeps only the reasoning
+            # head, the RESULT and handoff blocks follow as colored embeds on their own messages.
+            rich_blocks: List[Any] = []
+            full_content = content
+            if final_delivery:
+                head, rich_blocks = self._split_rich_blocks(content, allow_empty_head=True)
+                if rich_blocks:
+                    content = head
+                    if not content.strip():
+                        # The consumer split the reply on the block boundary, so this payload
+                        # IS the closing blocks: one message of embeds, no empty text bubble.
+                        result = await self._send_embed_only_message(
+                            channel, rich_blocks,
+                            reference=self._reply_reference_for_send(reply_to, channel))
+                        return await self._record_response_async(
+                            reply_to, result, full_content, final_delivery)
             formatted = self.format_message(content)
             chunks = self._cap_split_chunks(
                 self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2937,7 +2967,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(content=chunk, reference=chunk_reference)
+                    msg = await channel.send(
+                        content=chunk, reference=chunk_reference, **self._send_suppress_kwargs(channel))
                 except Exception as e:
                     if chunk_reference is not None and self._is_reply_reference_rejected(e):
                         logger.warning(
@@ -2945,7 +2976,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             self.name, reply_to,
                         )
                         reference = None
-                        msg = await channel.send(content=chunk, reference=None)
+                        msg = await channel.send(
+                            content=chunk, reference=None, **self._send_suppress_kwargs(channel))
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -2964,7 +2996,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
-            return await self._record_response_async(reply_to, result, content, final_delivery)
+            if rich_blocks:
+                await self._send_rich_blocks(chat_id, rich_blocks, metadata)
+            # Recovery/backfill must replay the whole reply, not just the head left in the message.
+            return await self._record_response_async(reply_to, result, full_content, final_delivery)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             if _is_discord_transport_error(e):
@@ -3001,7 +3036,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
-                msg = await thread_channel.send(content=chunk)
+                msg = await thread_channel.send(content=chunk, **self._send_suppress_kwargs(thread_channel))
                 message_ids.append(str(msg.id))
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
@@ -3068,7 +3103,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None, _rich_full_content: Optional[str] = None,
     ) -> SendResult:
         """Edit a sent Discord message. Oversized text (>2,000) must neither truncate silently nor
         fail (consumer re-sends -> dupe): mid-stream keep a truncated preview (splitting would move
@@ -3080,6 +3115,42 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        # Rich closing blocks: the streamed message keeps the reasoning head, the RESULT and handoff
+        # blocks become colored embeds on their own messages. Recurse once with the narrowed text so
+        # every path below (overflow split, reactive retry, dedup) still applies.
+        if _rich_full_content is None and finalize:
+            # allow_empty_head: an oversized reply is cut on the block
+            # boundary, so the LAST streamed message can hold nothing but the
+            # closing blocks. Rejecting that shape here (an edit may not blank
+            # a message) is what left the boxes as raw text on split turns.
+            head, blocks = self._split_rich_blocks(
+                content, allow_empty_head=True,
+            )
+            if blocks and head.strip():
+                result = await self.edit_message(
+                    chat_id, message_id, head, finalize=True, metadata=metadata,
+                    _rich_full_content=content,
+                )
+                if result.success:
+                    await self._send_rich_blocks(chat_id, blocks, metadata)
+                return result
+            if blocks:
+                # Nothing but blocks: swap this message's text for the embeds
+                # in place instead of blanking it and trailing a second one.
+                result = await self._edit_to_embed_only(
+                    chat_id, message_id, blocks,
+                )
+                if result.success:
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=(metadata or {}).get("reply_to_message_id"),
+                        result=result,
+                        content=content,
+                        final=True,
+                    )
+                    return result
+                # Embed edit failed - fall through and deliver plain text.
+
         try:
             channel = await self._resolve_channel(chat_id)
             msg = channel.get_partial_message(int(message_id))
@@ -3104,7 +3175,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 # Content shrank under the cap: clear saturation state so dedup can't mask a real edit.
                 self._last_overflow_preview.pop(_preview_key, None)
             try:
-                await msg.edit(content=formatted)
+                # Streaming edits re-trigger Discord's embed scan on any URL in the new content, so
+                # re-assert suppression here too: the send-time flag alone does not survive content edits.
+                await self._edit_stream_message(msg, formatted)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = formatted
             except Exception as edit_err:
@@ -3116,17 +3189,189 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     if self._last_overflow_preview.get(_preview_key) == truncated:
                         # Saturated-preview dedup (see pre-flight path above).
                         return SendResult(success=True, message_id=message_id)
-                    await msg.edit(content=truncated)
+                    await self._edit_stream_message(msg, truncated)
                     self._last_overflow_preview[_preview_key] = truncated
                 else:
                     raise
             result = SendResult(success=True, message_id=message_id)
             if finalize:
-                await self._record_response_async((metadata or {}).get("reply_to_message_id"), result, content, True)
+                # Recovery/backfill must replay the whole reply, not just the head left in the message.
+                await self._record_response_async(
+                    (metadata or {}).get("reply_to_message_id"), result,
+                    _rich_full_content or content, True)
             return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    def _split_rich_blocks(self, content: str, *, allow_empty_head: bool = False):
+        """Split a finished reply into its plain head and its colored blocks. Returns
+        ``(content, [])`` when the feature is off, discord.py is unavailable, or the reply does not
+        match the expected closing shape - the caller then delivers plain text exactly as before.
+        ``allow_empty_head`` is for the send path only: a fresh message can be embeds with no
+        text, an edit cannot (Discord rejects empty content)."""
+        if not self._rich_result_embeds or not DISCORD_AVAILABLE:
+            return content, []
+        try:
+            from plugins.platforms.discord.rich_blocks import split_rich_blocks
+            return split_rich_blocks(content, allow_empty_head=allow_empty_head)
+        except Exception:  # pragma: no cover - never break delivery over styling
+            logger.warning(
+                "[%s] Rich closing-block split failed; sending plain text", self.name, exc_info=True)
+            return content, []
+
+    def _build_rich_embed(self, block) -> Any:
+        """Convert a parsed block into a Discord embed."""
+        embed = discord.Embed(
+            title=block.title, description=block.description or None,
+            # Plain int: discord.py coerces it to a Colour, and it keeps the embed constructible
+            # under the test suite's discord stub.
+            color=block.color,
+        )
+        for item in block.fields:
+            embed.add_field(name=item.name, value=item.value, inline=False)
+        return embed
+
+    async def _edit_to_embed_only(
+        self,
+        chat_id: str,
+        message_id: str,
+        blocks: List[Any],
+    ) -> SendResult:
+        """Replace a streamed message's text with the closing-block embeds.
+
+        The consumer cuts an oversized reply on the block boundary, so the
+        tail message carries nothing but the closing blocks. Editing it to an
+        empty body is illegal, but an embed-only body is not: the embeds
+        become the message. SUPPRESS_EMBEDS, which every streamed send sets to
+        keep link previews out, has to be cleared in the same call - that flag
+        hides rich embeds too, so leaving it on would blank the message.
+
+        Returns a failed SendResult (never raises) so the caller can fall back
+        to delivering the block as plain text.
+        """
+        try:
+            channel = await self._resolve_channel(chat_id)
+            msg = channel.get_partial_message(int(message_id))
+            embeds = [self._build_rich_embed(block) for block in blocks]
+            if not self._suppress_link_previews or not DISCORD_AVAILABLE:
+                # The streamed send never set the flag, so a plain edit is
+                # enough (and is the route the test suite's stub supports).
+                await msg.edit(content="", embeds=embeds)
+                return SendResult(success=True, message_id=str(message_id))
+            flags = discord.MessageFlags()
+            flags.suppress_embeds = False
+            from discord.http import handle_message_parameters
+
+            with handle_message_parameters(
+                content="", embeds=embeds, flags=flags,
+            ) as params:
+                await msg._state.http.edit_message(
+                    msg.channel.id, msg.id, params=params,
+                )
+            return SendResult(success=True, message_id=str(message_id))
+        except Exception as err:  # pragma: no cover - defensive
+            logger.warning(
+                "[%s] Embed-only edit of %s failed; falling back to text: %s",
+                self.name,
+                message_id,
+                err,
+                exc_info=True,
+            )
+            return SendResult(success=False, error=str(err))
+
+    async def _send_embed_only_message(self, channel: Any, blocks: List[Any],
+                                       reference: Any = None) -> SendResult:
+        """Deliver closing blocks as one message with no text of its own.
+
+        Discord accepts up to 10 embeds per message and the closing shape never produces
+        more than three (result, recap, handoff), so one message carries them all and the
+        consumer still gets a real message id back to track."""
+        embeds = [self._build_rich_embed(block) for block in blocks]
+        try:
+            msg = await channel.send(content=None, embeds=embeds, reference=reference)
+        except Exception:
+            msg = await channel.send(content=None, embeds=embeds)
+        return SendResult(success=True, message_id=str(msg.id),
+                          raw_response={"message_ids": [str(msg.id)]})
+
+    def preferred_final_split_index(self, text: str, budget: int) -> Optional[int]:
+        """Where an oversized reply should be cut (see the base hook).
+
+        The colored closing blocks must reach the adapter whole or they render half as an
+        embed and half as plain text, so the cut goes on the rule that opens the first
+        block whenever that lands inside the budget."""
+        if not self._rich_result_embeds or not DISCORD_AVAILABLE:
+            return None
+        try:
+            from plugins.platforms.discord.rich_blocks import closing_block_offset
+            offset = closing_block_offset(text)
+        except Exception:  # pragma: no cover - never break delivery over styling
+            return None
+        if not offset or offset > budget:
+            return None
+        return offset
+
+    def preferred_final_chunks(self, text: str, budget: int) -> Optional[List[str]]:
+        """Chunk an oversized reply so the closing blocks travel whole (see the base hook).
+
+        ``preferred_final_split_index`` can only help while the boxes START inside the
+        budget. A long reasoning head pushed them past it, the hook declined, and the
+        blind line-break split cut a box in half - the half already on screen then sat
+        next to the re-rendered whole (observed live on 2026-09-14).
+
+        Here the head is chunked normally and the closing blocks are appended as ONE
+        final chunk whatever their length: that chunk is delivered as embeds, which
+        carry their own far larger budget, so text limits must not apply to it."""
+        if not self._rich_result_embeds or not DISCORD_AVAILABLE:
+            return None
+        try:
+            from plugins.platforms.discord.rich_blocks import (
+                closing_block_offset,
+                split_rich_blocks,
+            )
+
+            offset = closing_block_offset(text)
+            if offset is None:
+                # No head to cut: either not a closing shape at all, or the payload
+                # IS the blocks (the head was sealed on an earlier chunk).
+                head, blocks = split_rich_blocks(text, allow_empty_head=True)
+                if blocks and not head.strip():
+                    return [text]
+                return None
+            head, tail = text[:offset], text[offset:]
+            if not tail.strip():
+                return None
+            chunks: List[str] = []
+            if head.strip():
+                if len(head) > budget:
+                    chunks.extend(c for c in self.truncate_message(head, budget) if c.strip())
+                else:
+                    chunks.append(head)
+            chunks.append(tail)
+            return chunks
+        except Exception:  # pragma: no cover - never break delivery over styling
+            logger.warning(
+                "[%s] Rich closing-block chunking failed; using the plain split",
+                self.name, exc_info=True)
+            return None
+
+    async def _send_rich_blocks(
+        self, chat_id: str, blocks: List[Any], metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Post the colored closing blocks as their own messages. Delivery of the reply itself
+        already succeeded, so a failure here is logged and swallowed: a missing box is cosmetic, a
+        raised exception would look like a failed turn."""
+        try:
+            channel = await self._resolve_channel((metadata or {}).get("thread_id") or chat_id)
+            if not channel:
+                return
+            for block in blocks:
+                # No suppress_embeds here: that flag hides rich embeds too.
+                await channel.send(embed=self._build_rich_embed(block))
+        except Exception:
+            logger.warning(
+                "[%s] Failed to deliver rich closing blocks to %s", self.name, chat_id, exc_info=True)
 
     @staticmethod
     def _is_reply_reference_rejected(err: Exception) -> bool:
@@ -3135,6 +3380,47 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return (
             "error code: 50035" in err_text and "Cannot reply to a system message" in err_text
         ) or "error code: 10008" in err_text
+
+    @property
+    def _suppress_embeds(self) -> bool:
+        """Link-preview suppression for outgoing text (see ``suppress_link_previews``)."""
+        # getattr: tests build adapters via object.__new__() (no __init__).
+        return bool(getattr(self, "_suppress_link_previews", True))
+
+    def _send_suppress_kwargs(self, channel: Any) -> Dict[str, Any]:
+        """``{"suppress_embeds": True}`` for a real discord.py channel when link previews are off,
+        else ``{}`` (feature off, discord stubbed, or a duck-typed double whose ``send`` rejects the
+        keyword). Every production send target (TextChannel/Thread/DMChannel) is a ``Messageable``."""
+        if not self._suppress_embeds or not DISCORD_AVAILABLE:
+            return {}
+        messageable = getattr(getattr(discord, "abc", None), "Messageable", None)
+        if not isinstance(messageable, type) or not isinstance(channel, messageable):
+            return {}
+        return {"suppress_embeds": True}
+
+    async def _edit_stream_message(self, msg: Any, content: str) -> None:
+        """Edit a message and preserve link-preview suppression.
+
+        discord.py 2.7 dropped the high-level ``suppress`` keyword from ``PartialMessage.edit()``
+        (the no-fetch edit target used here); the REST edit endpoint still accepts message flags, so
+        send the SUPPRESS_EMBEDS bit through the supported low-level parameter builder. Falls back
+        to a plain edit when suppression is off, discord.py is stubbed, or ``msg`` is a duck-typed
+        double without an HTTP state.
+        """
+        http = getattr(getattr(msg, "_state", None), "http", None)
+        if not self._suppress_embeds or not DISCORD_AVAILABLE or http is None:
+            await msg.edit(content=content)
+            return
+        try:
+            from discord.http import handle_message_parameters
+            flags = discord.MessageFlags()
+            flags.suppress_embeds = True
+        except Exception:
+            # Stubbed/too-old discord module: keep the edit working; previews may reappear.
+            await msg.edit(content=content)
+            return
+        with handle_message_parameters(content=content, flags=flags) as params:
+            await http.edit_message(msg.channel.id, msg.id, params=params)
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
@@ -3156,10 +3442,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
         if len(chunks) <= 1:
             # Defensive: pre-flight should guarantee >1 chunk; otherwise edit normally.
-            await msg.edit(content=chunks[0] if chunks else formatted)
+            await self._edit_stream_message(msg, chunks[0] if chunks else formatted)
             return SendResult(success=True, message_id=message_id)
         try:
-            await msg.edit(content=chunks[0])
+            await self._edit_stream_message(msg, chunks[0])
         except Exception as e:
             logger.error(
                 "[%s] Overflow split: first-chunk edit failed: %s", self.name, e, exc_info=True,

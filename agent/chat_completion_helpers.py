@@ -40,7 +40,8 @@ from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (
-    _sanitize_surrogates, _repair_tool_call_arguments, normalize_finish_reason as _normalize_finish_reason,
+    _sanitize_surrogates, _repair_tool_call_arguments, strip_tool_trail_frames,
+    normalize_finish_reason as _normalize_finish_reason,
     sanitize_outbound_kwargs,
 )
 from agent.reasoning_summaries import append_streamed_reasoning_detail, separate_glued_reasoning_blocks
@@ -1473,7 +1474,13 @@ def _assistant_content_for_storage(agent, assistant_message):
     # strip inline <think> tags at the storage boundary (they leaked to platforms and
     # polluted titles), then redact inlined credentials before the message enters
     # history / state.db / gateway delivery (no-op with HERMES_REDACT_SECRETS off).
-    content = _sanitize_surrogates(flatten_message_text(getattr(assistant_message, "content", None)))
+    # Display-only proxy tool-trail frames die here, at the same storage
+    # boundary that strips think blocks below. They arrive on the content
+    # field as well as the stream, and leaving them in content desynchronized
+    # final_response from the stream ledger, which re-sent already delivered
+    # answers. See strip_tool_trail_frames for the full failure shape.
+    content = strip_tool_trail_frames(flatten_message_text(getattr(assistant_message, "content", None)))
+    content = _sanitize_surrogates(content)
     if isinstance(content, str) and content:
         content = agent._strip_think_blocks(content).strip()
         if content:

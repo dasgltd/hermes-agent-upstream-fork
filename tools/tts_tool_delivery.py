@@ -106,6 +106,30 @@ _OPUS_VOICE_ARGS = [
     "-acodec", "libopus", "-ac", "1", "-b:a", "48k", "-vbr", "on",
     "-application", "voip", "-compression_level", "10"]
 
+# DASG carried patch: Jarvis-style voice FX chain (Iron Man assistant timbre), applied on the
+# transcode to Ogg/Opus (voice-note path). Paired with a British male voice in config.yaml.
+# 3-tap echo (space) + flanger (metallic shimmer) + compression (even, machine delivery) + treble
+# lift (crisp) + band-limit (comms feel). Set env HERMES_TTS_VOICE_FX="off" to disable without a
+# code change.
+_JARVIS_TTS_FILTER = (
+    "atempo=1.25,"
+    "highpass=f=90,"
+    "acompressor=threshold=-20dB:ratio=3:attack=6:release=160,"
+    "aecho=0.8:0.9:32|48|65:0.14|0.09|0.05,"
+    "flanger=delay=2:depth=1.4:speed=0.35:width=38,"
+    "treble=g=3:f=3800,"
+    "lowpass=f=11000,"
+    "volume=16dB,"
+    "alimiter=limit=0.97"
+)
+
+
+def _voice_fx_args() -> List[str]:
+    """ffmpeg ``-af`` args for the Jarvis FX chain, or empty when HERMES_TTS_VOICE_FX is off."""
+    if os.environ.get("HERMES_TTS_VOICE_FX", "on").strip().lower() in ("off", "0", "false", "no"):
+        return []
+    return ["-af", _JARVIS_TTS_FILTER]
+
 
 # --- Text chunking and delivery profiles ---
 @dataclass(frozen=True)
@@ -288,8 +312,14 @@ def _write_wav_bytes_as(wav_bytes: bytes, output_path: str) -> str:
 
 def _convert_to_opus(mp3_path: str) -> Optional[str]:
     """Convert any ffmpeg-readable audio file to OGG Opus next to it; None on failure."""
+    # DASG carry: the Jarvis FX chain rides on the shared transcode. Both TTS->Opus paths
+    # (explicit _convert_to_opus and the _repair_ogg_container sniff) funnel through
+    # transcode_to_ogg_opus exactly once per synthesized file (repair only touches .ogg, finalize
+    # only non-.ogg), so the FX never stacks.
     from gateway.platforms.base import transcode_to_ogg_opus
-    return transcode_to_ogg_opus(mp3_path, bitrate="48k", timeout=30, output_path=mp3_path.rsplit(".", 1)[0] + ".ogg")
+    return transcode_to_ogg_opus(mp3_path, bitrate="48k", timeout=30,
+                                 output_path=mp3_path.rsplit(".", 1)[0] + ".ogg",
+                                 filter_args=_voice_fx_args())
 
 
 # --- Container sniffing / repair ---
@@ -315,7 +345,9 @@ def _repair_ogg_container(file_str: str) -> str:
         return file_str
     logger.info("TTS wrote %s bytes into a .ogg path (%s) — transcoding to real Ogg/Opus", container, file_str)
     from gateway.platforms.base import transcode_to_ogg_opus
-    repaired = transcode_to_ogg_opus(file_str, bitrate="48k", timeout=30, output_path=file_str)
+    # DASG carry: same FX chain as _convert_to_opus (see there); repair is the other TTS path.
+    repaired = transcode_to_ogg_opus(file_str, bitrate="48k", timeout=30, output_path=file_str,
+                                     filter_args=_voice_fx_args())
     if repaired:
         return repaired
     honest = f"{file_str[:-4]}.{container}"

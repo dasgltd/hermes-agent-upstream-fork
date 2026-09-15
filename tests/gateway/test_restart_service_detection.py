@@ -76,3 +76,30 @@ async def test_false_external_supervisor_marker_keeps_detached_path(
     await runner._handle_restart_command(_make_restart_event())
 
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+
+
+def test_restart_arms_proxy_and_agy_bridge_in_one_idle_gated_unit(monkeypatch):
+    """/restart must refresh both local model bridges before the gateway returns."""
+    runner, _adapter = make_restart_runner()
+    commands = []
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/tool")
+    monkeypatch.setattr("os.access", lambda *_: True)
+    monkeypatch.setattr("subprocess.run", lambda command, **_: commands.append(command))
+
+    assert runner._restart_claude_proxy_detached() is True
+    assert commands[0][-2:] == ["claude-proxy.service", "agy-bridge.service"]
+
+
+@pytest.mark.asyncio
+async def test_restart_handler_does_not_arm_proxy_restart_under_pytest(tmp_path, monkeypatch):
+    """The real /restart handler runs in this suite on a real host: the systemd side effect
+    must stay dormant under pytest (an explicit call above still exercises the arming logic)."""
+    runner = _make_runner_with_mock_restart(tmp_path, monkeypatch)
+    armed = []
+    monkeypatch.setattr(runner, "_restart_claude_proxy_detached", lambda: armed.append(True) or True)
+
+    await runner._handle_restart_command(_make_restart_event())
+
+    assert armed == []
+    runner.request_restart.assert_called_once()

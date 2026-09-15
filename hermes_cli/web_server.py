@@ -539,6 +539,23 @@ def _host_header_hostname(host_header: str) -> str:
     return value.lower()
 
 
+def _extra_allowed_hosts() -> frozenset:
+    """Operator-trusted Host names beyond the bound interface (DASG carry).
+
+    Read from ``HERMES_DASHBOARD_ALLOWED_HOSTS`` (comma-separated, case
+    insensitive, no port). Lets an operator whitelist specific trusted
+    hostnames (Tailscale MagicDNS name and tailnet IP) so a loopback-bound
+    dashboard stays reachable through ``tailscale serve`` WITHOUT a 0.0.0.0
+    bind and WITHOUT engaging the dashboard auth gate. Upstream's
+    ``dashboard.public_url`` covers a single hostname only and turns the
+    auth gate on even for a loopback bind, so it cannot replace this. This
+    narrows the anti-DNS-rebinding defence (GHSA-ppp5-vxwm-4cf7) to exactly
+    the named hosts rather than disabling it.
+    """
+    raw = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
+    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+
 def _is_accepted_host(
     host_header: str,
     bound_host: str,
@@ -550,12 +567,19 @@ def _is_accepted_host(
     - Exact bound host (with or without port suffix)
     - Loopback aliases when bound to loopback
     - Exact operator-declared public hosts (with or without port suffix)
+    - Any host named in HERMES_DASHBOARD_ALLOWED_HOSTS (operator opt-in)
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
     """
     host_only = _host_header_hostname(host_header)
     if not host_only:
         return False
+    # Operator-whitelisted trusted hosts (e.g. Tailscale MagicDNS name).
+    # Checked here so the HTTP middleware and the WebSocket Host/Origin
+    # guard (web_server_chat._ws_host_origin_reason) agree without touching
+    # app.state.trusted_public_hosts, which would also engage the auth gate.
+    if host_only in _extra_allowed_hosts():
+        return True
     # All-interfaces bind: no Host-layer defence is possible; rely on operator
     # network controls.
     if host_only in trusted_public_hosts or bound_host in {"0.0.0.0", "::"}:

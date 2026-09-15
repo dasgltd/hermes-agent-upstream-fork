@@ -631,3 +631,39 @@ async def test_empty_fallback_final_after_split_records_only_what_survives():
     # The head is gone from the chat, so the complete answer was NOT delivered:
     # the gateway must be told this is a mismatch and send it.
     assert consumer.delivered_final_matches(complete) is False
+
+
+@pytest.mark.asyncio
+async def test_chunk_flush_after_sealed_head_still_suppresses_duplicate():
+    """A split turn whose head was sealed off a LIVE message must not duplicate.
+
+    Shape taken from production: a short checkpoint message already exists and
+    is being edited, then a long answer arrives in one tick.  The seal loop
+    exits after ONE head because its condition requires ``_message_id`` to be
+    set, so the remaining tail (still over the cap) goes out as a fresh send.
+    Recording only that tail (or nothing at all) as the delivered payload made
+    ``delivered_final_matches`` report a mismatch and the gateway re-sent the
+    entire turn over an answer the user already had.
+
+    Measured on Discord: the same three messages delivered twice, differing
+    only in the adapter pagination suffix -- ``(1/2)``/``(2/2)`` on the first
+    delivery and ``(1/3)``/``(2/3)``/``(3/3)`` on the duplicate.  The recorder
+    must substitute the un-truncated ``_stream_ledger`` on every split path.
+    """
+    adapter, consumer = _split_consumer()
+    task = asyncio.create_task(consumer.run())
+    # A live message exists first (the streamed checkpoint in production).
+    consumer.on_delta("checkpoint line\n")
+    await asyncio.sleep(0.02)
+    assert consumer._message_id is not None, "no live message to edit"
+    # Then the long answer lands in a single tick: one head is sealed and the
+    # remaining tail is still over the cap.
+    body = [f"line {i} " + "y" * 180 for i in range(12)]
+    for line in body:
+        consumer.on_delta(line + "\n")
+    consumer.finish()
+    await asyncio.wait_for(task, timeout=10)
+
+    complete = "checkpoint line\n" + "\n".join(body)
+    assert consumer._turn_split_delivery is True, "split delivery never flagged"
+    assert consumer.delivered_final_matches(complete) is True

@@ -12,6 +12,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import inspect
+import json
 import logging
 import queue
 import secrets
@@ -47,11 +48,23 @@ _DONE = object()
 _NEW_SEGMENT = object()
 _COMMENTARY = object()
 _TOOL_PROGRESS = object()
+# (_TOOL_TRAIL, rendered) rendered proxy tool progress: visible in the progressive
+# message, never part of the final-answer ledger (see _scan_tool_trail).
+_TOOL_TRAIL = object()
 _FINAL_TEXT = object()
 _FLUSH = object()
 _APPROVAL_BOUNDARY = object()
 _REOPEN_SEED = object()
 _FUTURE_TYPES = (asyncio.Future, concurrent.futures.Future)
+
+# Private proxy-to-gateway frame. The proxy uses this only for rendered tool
+# progress. It is intentionally not user-configurable and never persists into
+# model history or the final-answer ledger.  The content boundary
+# (agent/message_sanitization.strip_tool_trail_frames) strips the same frame
+# from final_response and history; this consumer is the presentation half.
+# ADR: https://github.com/dasgltd/claude-proxy/blob/main/docs/decisoes/0003-tool-trails-are-display-only-not-final-response.md
+_TOOL_TRAIL_FRAME_PREFIX = "\x1eHERMES_TOOL_TRAIL:"
+_TOOL_TRAIL_FRAME_SUFFIX = "\x1f"
 
 # Boundary finalize text when nothing has accumulated yet (overridable per boundary).
 _DEFAULT_BOUNDARY_PLACEHOLDER = "⏸ 等待审批中..."
@@ -86,6 +99,7 @@ class _Tick:
     got_reopen_seed: bool = False
     approval_boundary: Optional[tuple] = None  # (future, cancelled_flag)
     commentary_text: Optional[str] = None
+    got_tool_trail: bool = False  # a rendered proxy tool trail landed this tick
     # Set by _push_update for _finalize_turn / _end_segment.
     update_visible: bool = False
     draft_final_fresh_send: bool = False
@@ -118,7 +132,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        anchor_reply_persistent: bool = False):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
@@ -128,6 +143,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._on_new_message = on_new_message
         self._on_before_finalize = on_before_finalize
         self._initial_reply_to_id = initial_reply_to_id
+        # Honor reply_to_mode="first" at the turn level: the first bubble lands
+        # and consumes the user-message quote. Subsequent segment/continuation sends
+        # must not re-quote the original message (adapters apply "first" per send()
+        # call only). Platforms whose thread semantics depend on the reply
+        # reference keep it explicitly.
+        self._anchor_reply_persistent = anchor_reply_persistent
+        # Hold a private proxy tool-trail frame when SSE splits it across deltas.
+        self._tool_trail_buffer = ""
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
         self._run_still_current = run_still_current or (lambda: True)
@@ -266,6 +289,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["notify"] = True
         return meta or None
 
+    def _consume_reply_anchor(self) -> None:
+        """Drop the user quote after the first successful content send."""
+        if not self._anchor_reply_persistent:
+            self._initial_reply_to_id = None
+
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
     already_sent = property(lambda self: self._already_sent)
     final_response_sent = property(lambda self: self._final_response_sent)
@@ -292,6 +320,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             self._tool_progress_active = False
         self._accumulated += text
         self._stream_ledger += text
+
+    def _append_tool_trail(self, text: str) -> None:
+        """Append rendered tool progress without treating it as model prose."""
+        if not text:
+            return
+        if self._accumulated and not self._accumulated.endswith("\n"):
+            self._accumulated += "\n"
+        self._accumulated += text.rstrip("\n") + "\n"
 
     def _mark_skip_redundant_finalize(self) -> None:
         """Mark the turn final as delivered by a prior mid-stream edit.  Records what was
@@ -516,16 +552,76 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def on_delta(self, text: str) -> None:
         """Thread-safe callback from the agent's worker thread.  ``None`` signals a tool
         boundary: the current message is finalized and subsequent text goes out as a new
-        message below any tool-progress messages."""
+        message below any tool-progress messages.
+
+        A private proxy frame carries rendered tool-progress lines. Those lines
+        remain visible in the progressive message, but bypass the final-answer
+        ledger so they cannot make an otherwise complete stream look stale."""
         if text:
-            self._queue.put(text)
+            self._scan_tool_trail(text)
         elif text is None:
             self.on_segment_break()
+
+    def _scan_tool_trail(self, text: str) -> None:
+        """Split private tool-trail frames out of a delta, anywhere they appear.
+
+        The proxy emits each frame as its own SSE event, but upstream
+        aggregation can deliver ``prose + frame + prose`` in a single delta
+        (measured in production). Matching only at the start of a delta let the
+        frame land in the prose queue, contaminating the final-answer ledger:
+        the completed answer then compared as stale and was re-sent on top of
+        an answer the user had already received.
+        """
+        buf = self._tool_trail_buffer + text
+        self._tool_trail_buffer = ""
+        while buf:
+            start = buf.find(_TOOL_TRAIL_FRAME_PREFIX)
+            if start < 0:
+                # A trailing partial sentinel must be held back, otherwise the
+                # raw frame bytes leak into the visible message.
+                hold = 0
+                for size in range(min(len(buf), len(_TOOL_TRAIL_FRAME_PREFIX) - 1), 0, -1):
+                    if _TOOL_TRAIL_FRAME_PREFIX.startswith(buf[-size:]):
+                        hold = size
+                        break
+                if hold:
+                    self._tool_trail_buffer = buf[-hold:]
+                    buf = buf[:-hold]
+                if buf:
+                    self._queue.put(buf)
+                return
+            if start:
+                self._queue.put(buf[:start])
+                buf = buf[start:]
+            end = buf.find(_TOOL_TRAIL_FRAME_SUFFIX, len(_TOOL_TRAIL_FRAME_PREFIX))
+            if end < 0:
+                self._tool_trail_buffer = buf
+                return
+            payload = buf[len(_TOOL_TRAIL_FRAME_PREFIX):end]
+            buf = buf[end + len(_TOOL_TRAIL_FRAME_SUFFIX):]
+            try:
+                lines = json.loads(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                lines = None
+            if isinstance(lines, list) and all(isinstance(line, str) for line in lines):
+                rendered = "\n".join(line for line in lines if line.strip())
+                if rendered:
+                    self._queue.put((_TOOL_TRAIL, rendered))
+            else:
+                # Not a valid frame after all - deliver verbatim, never drop text.
+                self._queue.put(
+                    _TOOL_TRAIL_FRAME_PREFIX + payload + _TOOL_TRAIL_FRAME_SUFFIX
+                )
 
     def finish(self, final_text: Optional[str] = None) -> None:
         """Signal stream completion.  ``final_text`` is the AUTHORITATIVE completed
         final_response (incl. post-stream augmentation the accumulator never saw); the drain
         loop adopts it as the finalize payload.  Interrupt/error paths call ``finish()`` bare."""
+        if self._tool_trail_buffer:
+            # An unterminated frame must not strand text at end of stream.  Queued
+            # before _FINAL_TEXT so it keeps stream order (it arrived before finish).
+            stranded, self._tool_trail_buffer = self._tool_trail_buffer, ""
+            self._queue.put(stranded)
         if final_text is not None:
             self._queue.put((_FINAL_TEXT, final_text))
         self._queue.put(_DONE)
@@ -568,6 +664,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     if not self._use_native_streaming and self._first_send_overflows():
                         if await self._split_first_send(tick):
                             return
+                        # Yield before re-entering: an adapter that keeps the buffer
+                        # whole makes no progress here, and ``continue`` skips the
+                        # sleep at the bottom of the loop (hot spin, no ticks drained).
+                        await asyncio.sleep(0.05)
                         continue
                     await self._seal_overflow_heads()
                     await self._push_update(tick)
@@ -629,8 +729,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def _drain_queue(self) -> "_Tick":
         """Drain everything queued so far into one tick.  Control sentinels stop the drain
-        (they take effect this tick); _FINAL_TEXT / _TOOL_PROGRESS / text deltas fold into
-        state so simultaneous items batch."""
+        (they take effect this tick); _FINAL_TEXT / _TOOL_PROGRESS / _TOOL_TRAIL / text
+        deltas fold into state so simultaneous items batch."""
         tick = _Tick()
         while True:
             try:
@@ -653,6 +753,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if self._use_native_streaming:
                     self._tool_progress_lines.append(item[1])
                     self._tool_progress_active = True
+            elif kind is _TOOL_TRAIL:  # visible progress, folded in stream order
+                self._append_tool_trail(item[1])
+                tick.got_tool_trail = True
             elif kind is _APPROVAL_BOUNDARY:
                 tick.approval_boundary = (item[1], item[2])
                 return tick
@@ -718,6 +821,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # platform-limit check (_len_fn is for overflow).
             should_edit = bool((elapsed >= self._current_edit_interval and self._accumulated)
                                or len(self._accumulated) >= self.cfg.buffer_threshold)
+        # A rendered proxy tool trail is the progress the user is waiting on: push
+        # it now rather than waiting out the edit interval.
+        should_edit = should_edit or tick.got_tool_trail
         # Defer mid-stream edits while the buffer could still resolve to a silence
         # marker ("NO"→"NO_REPLY"); got_done always resolves the buffer.
         return should_edit and not _is_partial_silence_marker(
@@ -727,7 +833,22 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """No message to edit yet and the buffer overflows: seal only the head chunks; the
         tail stays in _accumulated as the active preview later deltas edit in place.
         True when the turn finished here (the run loop returns)."""
-        chunks = self._truncate_for_stream(self._accumulated, self._safe_limit, self._len_fn)
+        chunks = self._chunks_with_boundary(self._accumulated, self._safe_limit, self._len_fn)
+        if chunks == [self._accumulated]:
+            # The adapter delivers this buffer whole (Discord re-renders the closing
+            # blocks as embeds, which carry their own budget). There is no head to
+            # seal, and a truncated preview of a box is exactly the half-rendered
+            # tail this path exists to prevent - hold it until the turn finalizes.
+            if not tick.got_done:
+                if tick.got_flush:
+                    self._signal_flush(tick.flush_event)
+                return False
+            self._final_response_sent = await self._send_or_edit(
+                self._accumulated, finalize=True)
+            if self._final_response_sent:
+                self._turn_split_delivery = True
+                self._mark_final_delivered(record=self._accumulated)
+            return True
         if len(chunks) <= 1:
             # Malformed/legacy adapter result must still be splittable.
             chunks = self._split_text_chunks(self._accumulated, self._safe_limit, self._len_fn)
@@ -781,9 +902,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Existing message overflowing: seal it with the head, start a new message for the rest."""
         while self._overflows() and self._message_id is not None and self._edit_supported:
             cp_budget = _custom_unit_to_cp(self._accumulated, self._safe_limit, self._len_fn)
-            split_at = self._accumulated.rfind("\n", 0, cp_budget)
-            if split_at < cp_budget // 2:
-                split_at = cp_budget
+            if self._adapter_final_chunks(self._accumulated, cp_budget) == [self._accumulated]:
+                # The adapter re-renders this whole buffer through a wider channel
+                # (Discord's embeds). Sealing a head here would cut that structure
+                # and leave the severed half on screen beside the finished one.
+                break
+            split_at = self._preferred_split_index(self._accumulated, cp_budget)
+            if split_at is None:
+                split_at = self._accumulated.rfind("\n", 0, cp_budget)
+                if split_at < cp_budget // 2:
+                    split_at = cp_budget
             chunk = self._accumulated[:split_at]
             # finalize=True: the sealed chunk is never edited again, so it needs its
             # rich-text pass now.  is_turn_final=False: a split head is not the
@@ -870,6 +998,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # message adapters out of the draft-frame branch, whose dedupe against the
             # last UNSEALED frame would report success with no transport call.
             await self._finalize_edit(self._accumulated)
+        # Every branch above converges here: the edit and skip-redundant lanes never had
+        # preview cleanup of their own, so an extra preview message of this segment used to
+        # survive next to the finalized answer (the raw duplicated tail).  Best-effort and
+        # idempotent - the fallback / fresh-final lanes already emptied their ids.
+        await self._sweep_orphan_previews()
 
     async def _finalize_edit(self, text: str, *, record: bool = True) -> bool:
         """finalize=True send_or_edit; on success mark the turn delivered (+ record payload)."""

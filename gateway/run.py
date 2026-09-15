@@ -633,6 +633,34 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+# DASG carried patch (fix-leaked-turn-markers). Canonical conversation turn delimiters. When a
+# generation runs past the end of its turn the model can emit these verbatim (its training-time role
+# markers), fabricate a "[Name] ..." user line and answer itself, producing a second reply inside one
+# generation. Worse: the leaked blob is persisted as assistant content and replayed next turn, teaching
+# the model that self-Q&A is in-distribution (the feedback loop behind topic bleed after a resume or
+# restart). The reply is truncated at the first such marker that STARTS a line, on both the display
+# boundary (_sanitize_gateway_final_response) and the replay boundary (_build_replay_entry), so the
+# poison never reaches the screen and never re-enters history; already-poisoned transcripts self-heal
+# on the next reload. Inline mentions in prose or code ("the `Human:` marker") are not preceded by a
+# bare newline+marker and are left untouched.
+_LEAKED_TURN_MARKER_RE = re.compile(r"\n[ \t]*\n?[ \t]*(?:Human|Assistant)[ \t]*:")
+
+
+def _strip_leaked_turn_markers(text: Any) -> Any:
+    """Truncate a reply at the first leaked ``Human:``/``Assistant:`` turn marker that starts a line.
+
+    Unchanged when no marker starts a line; otherwise everything from the marker onward (the
+    fabricated continuation) is dropped and the surviving reply is right-stripped. Non-string input
+    (structured content blocks) is returned as-is.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    match = _LEAKED_TURN_MARKER_RE.search(text)
+    if match is None:
+        return text
+    return text[: match.start()].rstrip()
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies for chat surfaces: concise, secret-redacted provider failure
     categories instead of raw HTTP bodies, request IDs, leaked credentials, or policy text."""
@@ -654,6 +682,11 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     # See #7921.
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
+
+    # DASG carried patch (fix-leaked-turn-markers): on every non-raw chat surface, strip leaked
+    # conversation turn markers so a model that ran past its turn never shows a fabricated
+    # ``Human:``/``Assistant:`` exchange on screen.
+    text = _strip_leaked_turn_markers(str(text))
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
@@ -1100,6 +1133,15 @@ def _build_replay_entry(
     send no ``reasoning_content`` at all on the next turn, which can cause HTTP 400 from strict thinking
     providers.
     """
+    # DASG carried patch (fix-leaked-turn-markers): self-heal poisoned transcripts on reload. If a
+    # prior generation leaked a fabricated ``Human:``/``Assistant:`` turn into its own assistant
+    # content, scrub it here so the model never sees its own confabulated dialogue again. Every
+    # reload re-reads through this path, so this seam breaks the feedback loop regardless of how the
+    # poison entered. Only string content is touched; a scrubbed row also fails the
+    # ``content == msg.get("content")`` sidecar check below, so the poisoned ``api_content`` is dropped.
+    if role == "assistant" and isinstance(content, str):
+        content = _strip_leaked_turn_markers(content)
+
     entry: Dict[str, Any] = {"role": role, "content": content}
     # api_content sidecar keeps the request prefix byte-stable — ONLY if this pipeline did not rewrite
     # content. The caller renders timestamps AFTER this check so a stamp alone never drops the sidecar.
@@ -2239,6 +2281,14 @@ def _resolve_runtime_agent_kwargs() -> dict:
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+    except OSError as exc:
+        # DASG carried patch (2026-08-07): a filesystem/IO failure surfacing mid-resolution (disk-quota
+        # exhaustion writing a temp/lock file) is NOT a credential problem, but the api_server caller
+        # (_ProviderAuthResolutionError handling) prints every RuntimeError raised here as "Provider
+        # authentication failed" - a /tmp quota OSError sent the on-call after credentials for hours.
+        # Still a RuntimeError (keeps the graceful final_response shape instead of a raw 500) but with
+        # an honest wording, and the real exception stays reachable via __cause__.
+        raise RuntimeError(f"Provider config resolution hit an I/O error (not a credential problem): {exc}") from exc
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 

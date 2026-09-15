@@ -189,7 +189,11 @@ class GatewayAgentCacheMixin:
         model = override.get("model", model)
         for key in _OVERRIDE_APPLY_KEYS:
             val = override.get(key)
-            if val is not None:
+            # DASG carried patch (2026-07-17): skip empty strings, not just None. /model stores
+            # base_url="" for named providers and the override survives restarts in the session store;
+            # letting "" clobber the config base_url bypasses the local claude-proxy and every Anthropic
+            # call 401s into the Codex fallback.
+            if val not in (None, ""):
                 runtime_kwargs[key] = val
         # request_overrides reflects the switched-to provider; apply whenever the override recorded
         # it (even as None) so switching to a provider without configured overrides clears a stale

@@ -8,6 +8,14 @@ only on SendResult.success | mark_failed() 'failed' on a definitive rejection. C
 rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
 and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). Everything is
 best-effort: ledger failures must never block a send; callers wrap every call in try/except.
+
+DASG carry (2026-08-21): ``sweep_recoverable`` only claims rows whose owner is DEAD and
+``sweep_failed_for_runtime`` only claims reconnect/flood refusals, so a plain platform rejection
+(a Discord 5xx on the final send) left a ``failed`` row owned by a gateway that was still alive,
+and the turn's output sat undelivered until an operator forced a restart. ``sweep_retryable``
+closes that hole: it claims this live process's ``failed`` rows with any OTHER error once their
+backoff has elapsed. The three sweeps partition the space (dead owner / live owner with a
+reconnect-or-flood error / live owner with any other error) and share one ``attempts`` budget.
 """
 
 from __future__ import annotations
@@ -47,6 +55,17 @@ RECONNECTED_MARKER = ("♻️ Recovered reply — the messaging platform reconne
 # of the markers above tells the truth here (no restart, no reconnect): the rate limit gets its own.
 FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit refused the original, so part of "
                 "it may already have arrived above:\n\n")
+
+# DASG carry: in-process retry backoff for ``sweep_retryable``, indexed by the attempts already made
+# (attempts=0 -> first retry after 30s). A row whose attempts reach MAX_ATTEMPTS is abandoned by the
+# same cap the crash path uses, so the sweeps share one retry budget and a poison row cannot spin.
+RETRY_BACKOFF_SECONDS = (30.0, 120.0, 600.0)
+# Marker for a live-process retry after a plain platform rejection. The crash wording ("the gateway
+# restarted") and the reconnect wording would both be lies here: the gateway never went down and no
+# reconnect happened, the platform refused the send. Still labeled: a 5xx can hide a delivery that
+# actually landed.
+RETRY_MARKER = ("♻️ Retried delivery — the first send was rejected by the platform, "
+                "so this may be a duplicate:\n\n")
 
 # Runtime replay is fail-closed: only errors whose send contract proves they are transient reconnect
 # failures. Permanent rejects (blocked bot, bad auth, missing chat) must not be retried on reconnect.
@@ -464,6 +483,96 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
             earliest[key] = due
     return [{"platform": platform, "profile": profile, "not_before": due}
             for (platform, profile), due in sorted(earliest.items())]
+
+
+def sweep_retryable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
+                    deliverable_targets: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Claim this process's ``failed`` rows for in-process retry after a plain platform rejection.
+
+    DASG carry (2026-08-21 incident, thread 1539072364405330062). Complements the two upstream sweeps
+    without overlapping them: ``sweep_recoverable`` claims only rows whose owner is DEAD (crash
+    recovery) and ``sweep_failed_for_runtime`` claims only reconnect (``send_path_degraded``) and
+    flood-refused rows, on reconnect or on the flood timer. A row refused with any other error (a
+    Discord 5xx on the final send) was owned by a gateway that never died, so nothing re-claimed it
+    and the answer sat ``failed``/attempts=0 until a restart.
+
+    Partition key: ``owner_pid`` + ``owner_started_at`` must be THIS process instance (fail closed
+    when the start time is unreadable, exactly as the runtime sweep does) and ``last_error`` must NOT
+    be runtime-retryable (those rows belong to the reconnect sweep and the flood timers). A row is
+    claimed only after ``RETRY_BACKOFF_SECONDS[attempts]`` has elapsed since ``updated_at`` so an
+    outage lasting minutes is retried on a widening interval rather than hammered. Rows over the
+    attempts cap or the stale cutoff transition to 'abandoned' as in the crash path: one shared
+    budget. ``deliverable_platforms`` / ``deliverable_targets`` keep that budget from being spent on
+    a platform or bot identity that cannot send right now. Every claimed row carries
+    ``RETRY_MARKER`` (a 5xx can hide a message that actually landed) and is flagged
+    ``runtime_recovery`` so the runner refunds the attempt if the adapter vanished before dispatch.
+    """
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+    if started is None:  # pid alone cannot prove a row is ours after pid reuse: fail closed
+        return []
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                      content, attempts, created_at, updated_at,
+                      owner_pid, owner_started_at, last_error, adapter_profile
+               FROM delivery_obligations
+               WHERE state='failed' AND owner_pid=?""", (pid,)).fetchall()
+        for (oid, session_key, platform, chat_id, thread_id, content, attempts, created_at, updated_at,
+             owner_pid, owner_started_at, last_error, adapter_profile) in rows:
+            try:
+                if owner_started_at is None or int(owner_started_at) != int(started):
+                    continue  # same pid number, different process instance: not ours to retry
+            except (TypeError, ValueError):
+                continue
+            if _runtime_retryable(last_error):
+                continue  # reconnect / flood refusals: the runtime sweep and flood timers own these
+            owner_guard = (now, oid, owner_pid, owner_started_at)
+            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?
+                       WHERE obligation_id=? AND state='failed'
+                         AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
+                continue
+            profile = adapter_profile or "default"
+            if ((deliverable_platforms is not None and platform not in deliverable_platforms)
+                    or (deliverable_targets is not None and (platform, profile) not in deliverable_targets)):
+                continue  # no adapter for this target right now: claiming would spend an attempt on a no-op
+            try:
+                backoff = RETRY_BACKOFF_SECONDS[int(attempts)]
+            except (IndexError, TypeError, ValueError):
+                backoff = RETRY_BACKOFF_SECONDS[-1]
+            if (now - (updated_at or 0.0)) < backoff:
+                continue  # still cooling down
+            # A fresh attempt clears the stale refusal: if the resend is interrupted the next boot sees
+            # 'attempting' with no proof of non-delivery and redelivers with the crash marker.
+            cursor = conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='attempting', attempts=attempts+1, updated_at=?, last_error=NULL,
+                       adapter_profile=COALESCE(adapter_profile, 'default')
+                   WHERE obligation_id=? AND state='failed'
+                     AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
+            if cursor.rowcount:
+                row = _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
+                                   profile, needs_marker=True, last_error=last_error)
+                row["marker"] = RETRY_MARKER
+                row["runtime_recovery"] = True
+                claimed.append(row)
+    return claimed
+
+
+def retry_sweep_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Read the ``gateway.delivery_retry_sweep`` config gate (default on). DASG carry: separate from
+    ``ledger_enabled`` so the in-process retry can be turned off without losing crash recovery."""
+    try:
+        if config is None:
+            from hermes_cli.config import load_config
+            config = load_config()
+        value = (config.get("gateway") or {}).get("delivery_retry_sweep", True)
+        return value.strip().lower() not in {"false", "0", "no", "off"} if isinstance(value, str) else bool(value)
+    except Exception:
+        return True
 
 
 def _prune(now: Optional[float] = None) -> None:

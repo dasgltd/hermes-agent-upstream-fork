@@ -928,6 +928,10 @@ class TurnRunner:
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        # DASG carried patch (fix-reply-to-mode-first, pairs with stream_consumer.py):
+                        # platforms whose thread semantics depend on the reply reference keep it on
+                        # every bubble; everywhere else the first bubble consumes the quote.
+                        anchor_reply_persistent=ctx.source.platform in (Platform.FEISHU, Platform.MATTERMOST),
                     )
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)

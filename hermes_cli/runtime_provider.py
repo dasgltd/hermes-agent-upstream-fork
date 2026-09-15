@@ -274,7 +274,12 @@ def _anthropic_base_url_override_ok(base_url: str) -> bool:
     ``https://api.anthropic.com`` so a stale non-Anthropic URL cannot hijack native Anthropic."""
     candidate = (base_url or "").strip()
     hostname = (base_url_hostname(candidate) or "").lower() if candidate else ""
+    # DASG carried patch (2026-07-18): a loopback claude-proxy is a legitimate Anthropic
+    # endpoint. Without this, config base_url http://127.0.0.1:11435 is discarded on every
+    # override-less session (e.g. fresh Discord threads), traffic goes straight to
+    # api.anthropic.com with the placeholder key, and each turn 401s into the codex fallback.
     return bool(hostname) and (hostname == "api.anthropic.com" or hostname.endswith((".anthropic.com", ".claude.com", ".azure.com"))
+                               or _loopback_hostname(hostname)
                                or _detect_api_mode_for_url(candidate) == "anthropic_messages")
 
 

@@ -672,15 +672,28 @@ class GatewayTurnMixin:
         # with a threshold multiplier.
         from agent.image_token_cost import image_cost_context, learned_image_token_cost
         _anchored = None
+        # DASG carried patch (proxy-aware hygiene). EXCEPTION for claude-proxy sessions: last_prompt_tokens
+        # is input + cache_read + cache_write taken from the claude CLI's `result` event, whose usage is
+        # CUMULATIVE across every internal agentic tool-turn of the run. Each internal turn re-reads the
+        # whole cached prefix, so the same context is counted once per tool call and the total overstates
+        # real context by 10-20x (observed: 116K of stored transcript reported as ~2.0M "prompt tokens").
+        # The persisted usage anchor is derived from the same figure. Trusting either makes hygiene
+        # compress sessions nowhere near their context limit, burning a full aux summarizer call every
+        # sweep and never shrinking anything. For proxy-backed sessions the rough char estimate is the
+        # honest signal.
+        _bu = (hs.base_url or "").lower()
+        _is_proxy_backed = "11435" in _bu and ("127.0.0.1" in _bu or "localhost" in _bu or "::1" in _bu)
         # Images in any local delta/estimate are priced at the cost learned from this model's usage.
         with image_cost_context(learned_image_token_cost(hs.model, hs.base_url)):
-            if session_entry.last_prompt_tokens <= 0:
+            if session_entry.last_prompt_tokens <= 0 and not _is_proxy_backed:
                 from agent.usage_anchor import persisted_anchor_tokens
                 _session_db = getattr(self, "_session_db", None)
                 _anchored = persisted_anchor_tokens(
                     getattr(_session_db, "_db", _session_db), session_entry.session_id, history,
                 )
-            if session_entry.last_prompt_tokens > 0:
+            if _is_proxy_backed:
+                _approx_tokens, _token_source = estimate_messages_tokens_rough(history), "estimated-proxy"
+            elif session_entry.last_prompt_tokens > 0:
                 _approx_tokens, _token_source = session_entry.last_prompt_tokens, "actual"
             elif _anchored is not None:
                 _approx_tokens, _token_source = _anchored, "anchored"
@@ -2098,7 +2111,18 @@ class GatewayTurnMixin:
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
-                run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
+                run_generation=run_generation,
+                # DASG carried patch: Telegram DM: only the auto voice-reply bubble quotes the user's
+                # message. Suppress the text/streaming reply anchor here so the text answer is NOT sent
+                # as a reply (Daniel 2026-07-21). The voice path computes its own anchor in
+                # _deliver_voice_reply, so the audio still quotes the triggering message. Other
+                # platforms and non-DM chats keep the normal reply anchor.
+                event_message_id=(
+                    None
+                    if (getattr(source, "platform", None) == Platform.TELEGRAM
+                        and getattr(source, "chat_type", None) == "dm")
+                    else self._reply_anchor_for_event(event)
+                ),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=event.channel_prompt, moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=prepared.persist_user_message,
@@ -2595,6 +2619,8 @@ class GatewayTurnMixin:
                 adapter=_adapter, chat_id=source.chat_id, config=_consumer_cfg,
                 metadata=_thread_metadata, on_before_finalize=_pause_typing_before_finalize,
                 initial_reply_to_id=event_message_id, run_still_current=_run_still_current,
+                # DASG carried patch (fix-reply-to-mode-first, pairs with stream_consumer.py).
+                anchor_reply_persistent=source.platform in (Platform.FEISHU, Platform.MATTERMOST),
             )
         except Exception as _sc_err:
             logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)

@@ -1068,6 +1068,82 @@ class TestRunsProviderAuthFailure:
                 )
                 assert status["last_event"] == "run.failed"
 
+    @pytest.mark.asyncio
+    async def test_status_reports_io_rooted_failure_honestly(self, adapter):
+        """DASG carry: a _ProviderAuthResolutionError whose __cause__ chain
+        bottoms out in an OSError (e.g. disk quota while reading config) must
+        NOT be reported as an authentication failure (2026-08-07 incident)."""
+        from gateway.platforms.api_server import _ProviderAuthResolutionError
+
+        def _boom(*_args, **_kwargs):
+            try:
+                raise OSError(122, "Disk quota exceeded")
+            except OSError as io_exc:
+                try:
+                    raise RuntimeError(f"Failed to resolve provider: {io_exc}") from io_exc
+                except RuntimeError as rt_exc:
+                    raise _ProviderAuthResolutionError(str(rt_exc)) from rt_exc
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.side_effect = _boom
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(40):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "failed"
+                assert status["error"].startswith(
+                    "⚠️ Provider config resolution hit an I/O error (not a credential problem): "
+                )
+                assert "Disk quota exceeded" in status["error"]
+                assert "authentication failed" not in status["error"]
+
+
+class TestProviderErrorDisplayMessage:
+    """Unit tests for the DASG carry helper _provider_error_display_message."""
+
+    def test_plain_auth_failure_keeps_auth_wording(self):
+        from gateway.platforms.api_server import (
+            _ProviderAuthResolutionError, _provider_error_display_message)
+
+        exc = _ProviderAuthResolutionError("No credentials found for provider 'nous'")
+        assert _provider_error_display_message(exc) == (
+            "⚠️ Provider authentication failed: No credentials found for provider 'nous'")
+
+    def test_oserror_anywhere_in_cause_chain_is_reported_as_io(self):
+        from gateway.platforms.api_server import (
+            _ProviderAuthResolutionError, _provider_error_display_message)
+
+        try:
+            try:
+                raise PermissionError("/tmp/x: Permission denied")
+            except PermissionError as io_exc:
+                raise RuntimeError("wrapped once") from io_exc
+        except RuntimeError as rt_exc:
+            exc = _ProviderAuthResolutionError("wrapped twice")
+            exc.__cause__ = rt_exc
+        msg = _provider_error_display_message(exc)
+        assert msg.startswith("⚠️ Provider config resolution hit an I/O error")
+        assert msg.endswith(": wrapped twice")
+
+    def test_cause_cycle_terminates(self):
+        from gateway.platforms.api_server import (
+            _ProviderAuthResolutionError, _provider_error_display_message)
+
+        a = _ProviderAuthResolutionError("a")
+        b = RuntimeError("b")
+        a.__cause__ = b
+        b.__cause__ = a
+        assert _provider_error_display_message(a) == "⚠️ Provider authentication failed: a"
+
 
 # ---------------------------------------------------------------------------
 # POST /v1/runs idempotency

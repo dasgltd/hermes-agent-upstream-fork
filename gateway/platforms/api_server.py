@@ -1064,6 +1064,30 @@ class _ProviderAuthResolutionError(RuntimeError):
     RuntimeErrors from run_conversation() (e.g. a closed OpenAI client) as auth failures."""
 
 
+def _provider_error_display_message(exc: BaseException) -> str:
+    """Render the user-safe text for a caught _ProviderAuthResolutionError (DASG carry).
+
+    gateway.run._resolve_runtime_agent_kwargs() and
+    _resolve_runtime_agent_kwargs_for_provider() wrap every non-AuthError
+    exception from resolve_runtime_provider() as RuntimeError, including plain
+    I/O failures (e.g. a /tmp disk-quota OSError hit while reading config or a
+    lock/cache file) -- those are NOT credential problems. Confirmed 2026-08-07:
+    exactly this happened live and the resulting "Provider authentication
+    failed" message sent the on-call chasing a re-auth for hours instead of
+    the real disk issue. Walk __cause__ (preserved by the `raise ... from exc`
+    chains in gateway/run.py and here) looking for an OSError root before
+    defaulting to the auth-failure wording.
+    """
+    root: Optional[BaseException] = exc
+    seen: set = set()
+    while root is not None and id(root) not in seen:
+        seen.add(id(root))
+        if isinstance(root, OSError):
+            return f"⚠️ Provider config resolution hit an I/O error (not a credential problem): {exc}"
+        root = root.__cause__
+    return f"⚠️ Provider authentication failed: {exc}"
+
+
 class _SessionEventQueue:
     """Ordered SSE event queue for one /api/sessions/{id}/chat/stream run. ``payload`` stamps
     session_id/run_id/seq/ts; ``enqueue`` is executor-thread safe (hops onto the owning loop)."""
@@ -3761,10 +3785,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 except _ProviderAuthResolutionError as exc:
                     # Typed provider-auth failure only, handled once for every caller in
                     # run.py's response shape (text, no HTTP error).
-                    logger.warning("Provider authentication failed for session=%s: %s",
+                    _display_msg = _provider_error_display_message(exc)
+                    logger.warning("Provider resolution failed for session=%s: %s",
                                    session_id or "", exc)
                     return (
-                        {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [],
+                        {"final_response": _display_msg, "messages": [],
                          "api_calls": 0, "tools": []},
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
                 finally:

@@ -39,6 +39,26 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _merge_transcript_prefix(prefix: str, user_text: str, placeholder: str) -> str:
+    """Prepend STT output (or its failure note) to the caption text.
+
+    DASG carry (2026-09-11, thread 1524911438005534830). The Discord adapter delivers a captionless
+    voice note as the literal empty-content ``placeholder``. Upstream only dropped it on an EXACT
+    match, but multi-user threads have already wrapped it behind the sender label by the time STT
+    runs ("[Daniel] (The user sent a message with no text content)"), so the literal "no text
+    content" survived next to the transcript. Weaker models read it as "the real message was lost"
+    and went hunting for the previous prompt instead of acting on the transcript. Recognise the
+    placeholder as a suffix and keep the sender label in front of the transcript.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return prefix
+    if text.endswith(placeholder):
+        label = text[: -len(placeholder)].rstrip()
+        return f"{label} {prefix}" if label else prefix
+    return f"{prefix}\n\n{user_text}"
+
+
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -1976,9 +1996,7 @@ class GatewayInboundMixin:
     @classmethod
     def _prepend_media_prefix(cls, prefix: str, user_text: str) -> str:
         """``prefix`` + the user's text; the Discord empty-content placeholder is dropped as redundant."""
-        if user_text and user_text.strip() != cls._EMPTY_TEXT_PLACEHOLDER:
-            return f"{prefix}\n\n{user_text}"
-        return prefix
+        return _merge_transcript_prefix(prefix, user_text, cls._EMPTY_TEXT_PLACEHOLDER)
 
     @staticmethod
     def _untranscribed_audio_note(path: str) -> str:

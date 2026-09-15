@@ -683,9 +683,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
-        # Same controlled provider-auth message the _run_agent() endpoints give.
-        logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-        _finish("failed", error=f"⚠️ Provider authentication failed: {exc}")
+        # Same controlled provider message the _run_agent() endpoints give
+        # (DASG carry: I/O-rooted failures are not reported as auth failures).
+        logger.warning("Provider resolution failed for run=%s: %s", run_id, exc)
+        _finish("failed", error=_api_server._provider_error_display_message(exc))
     except Exception as exc:
         logger.exception("[api_server] run %s failed", run_id)
         _finish("failed", error=_redact_api_error_text(exc))

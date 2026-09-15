@@ -525,3 +525,78 @@ class TestCookiePathRespectsPrefix:
         assert "Path=/hermes" in at_cookies[0]
         assert "Secure" in at_cookies[0]
         assert "HttpOnly" in at_cookies[0]
+
+
+# ---------------------------------------------------------------------------
+# DASG carry: HERMES_DASHBOARD_BASE_PATH fallback for the SPA mount
+# ---------------------------------------------------------------------------
+
+
+class TestBasePathEnvFallback:
+    """``tailscale serve --set-path /hermes`` proxies to :9119 without injecting
+    X-Forwarded-Prefix. The SPA mount falls back to HERMES_DASHBOARD_BASE_PATH so
+    absolute asset URLs and __HERMES_BASE_PATH__ still go through the proxy."""
+
+    def test_env_unset_keeps_root_relative(self, monkeypatch):
+        from hermes_cli.web_server_dashboard import _normalise_prefix
+
+        monkeypatch.delenv("HERMES_DASHBOARD_BASE_PATH", raising=False)
+        assert _normalise_prefix(None) == ""
+        assert _normalise_prefix("") == ""
+
+    def test_env_used_when_header_absent_and_header_wins(self, monkeypatch):
+        from hermes_cli.web_server_dashboard import _normalise_prefix
+
+        monkeypatch.setenv("HERMES_DASHBOARD_BASE_PATH", "/hermes/")
+        assert _normalise_prefix(None) == "/hermes"
+        assert _normalise_prefix("") == "/hermes"
+        # An explicit proxy header still takes precedence over the env fallback.
+        assert _normalise_prefix("/other") == "/other"
+
+    def test_malformed_env_value_is_rejected_like_a_header(self, monkeypatch):
+        from hermes_cli.web_server_dashboard import _normalise_prefix
+
+        prefix_mod._warned_malformed_prefixes.clear()
+        monkeypatch.setenv("HERMES_DASHBOARD_BASE_PATH", "/hermes/../evil")
+        assert _normalise_prefix(None) == ""
+
+    @staticmethod
+    def _mount_spa_client(tmp_path, monkeypatch):
+        from fastapi import FastAPI
+        from hermes_cli import web_server_dashboard
+
+        dist = tmp_path / "web_dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text(
+            '<html><head><link rel="stylesheet" href="/assets/index-abc.css">'
+            '<script src="/assets/index-abc.js"></script></head><body>SPA</body></html>',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(web_server, "WEB_DIST", dist)
+        monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
+        spa_app = FastAPI()
+        web_server_dashboard.mount_spa(spa_app)
+        return TestClient(spa_app)
+
+    def test_index_rewritten_from_env_without_proxy_header(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_DASHBOARD_BASE_PATH", "/hermes")
+        client = self._mount_spa_client(tmp_path, monkeypatch)
+
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert 'window.__HERMES_BASE_PATH__="/hermes";' in resp.text
+        assert 'href="/hermes/assets/index-abc.css"' in resp.text
+        assert 'src="/hermes/assets/index-abc.js"' in resp.text
+
+        # Header present: it wins over the env fallback.
+        resp = client.get("/", headers={"X-Forwarded-Prefix": "/other"})
+        assert 'window.__HERMES_BASE_PATH__="/other";' in resp.text
+        assert 'href="/other/assets/index-abc.css"' in resp.text
+
+    def test_index_unchanged_when_env_unset(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_DASHBOARD_BASE_PATH", raising=False)
+        client = self._mount_spa_client(tmp_path, monkeypatch)
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert 'window.__HERMES_BASE_PATH__="";' in resp.text
+        assert 'href="/assets/index-abc.css"' in resp.text
