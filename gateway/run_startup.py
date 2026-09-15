@@ -411,7 +411,14 @@ class GatewayStartupMixin:
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            # A recovered reply IS the turn's final response, and the adapters gate the rich
+            # closing-block renderer on ``notify`` (Discord: ``final_delivery``). Without it the
+            # redelivery bypassed the renderer entirely: the colored RESULT/handoff embeds came
+            # back as raw markdown, blind-split by size into "(1/5)" chunks. Same metadata the
+            # live final send uses, so recovery and normal delivery render identically.
+            metadata = {"notify": True}
+            if row.get("thread_id"):
+                metadata["thread_id"] = row["thread_id"]
             try:
                 result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:
