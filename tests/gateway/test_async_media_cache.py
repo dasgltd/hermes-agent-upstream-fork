@@ -9,20 +9,38 @@ import gateway.platforms.base as base
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_name", "sync_name", "args"),
+    ("async_name", "sync_name", "args", "forwarded"),
     [
-        ("cache_image_from_bytes_async", "cache_image_from_bytes", (b"data", ".png")),
-        ("cache_audio_from_bytes_async", "cache_audio_from_bytes", (b"data", ".ogg")),
-        ("cache_video_from_bytes_async", "cache_video_from_bytes", (b"data", ".mp4")),
+        # The image wrapper also forwards ``original_name`` (None when the caller omits it),
+        # so the sync callee sees three positional args, not two.
+        (
+            "cache_image_from_bytes_async",
+            "cache_image_from_bytes",
+            (b"data", ".png"),
+            (b"data", ".png", None),
+        ),
+        (
+            "cache_audio_from_bytes_async",
+            "cache_audio_from_bytes",
+            (b"data", ".ogg"),
+            (b"data", ".ogg"),
+        ),
+        (
+            "cache_video_from_bytes_async",
+            "cache_video_from_bytes",
+            (b"data", ".mp4"),
+            (b"data", ".mp4"),
+        ),
         (
             "cache_document_from_bytes_async",
             "cache_document_from_bytes",
+            (b"data", "report.pdf"),
             (b"data", "report.pdf"),
         ),
     ],
 )
 async def test_async_cache_wrappers_keep_event_loop_responsive(
-    monkeypatch, async_name, sync_name, args
+    monkeypatch, async_name, sync_name, args, forwarded
 ):
     loop_thread = threading.get_ident()
     cache_started = threading.Event()
@@ -48,14 +66,14 @@ async def test_async_cache_wrappers_keep_event_loop_responsive(
     await ticker_task
 
     assert result == "cached"
-    assert observed["args"] == args
+    assert observed["args"] == forwarded
     assert observed["thread"] != loop_thread
     assert observed["ticker_ran_during_cache"] is True
 
 
 @pytest.mark.asyncio
 async def test_async_cache_wrapper_propagates_validation_errors(monkeypatch):
-    def reject_image(data, ext):
+    def reject_image(data, ext, original_name=None):
         raise ValueError("invalid image")
 
     monkeypatch.setattr(base, "cache_image_from_bytes", reject_image)
