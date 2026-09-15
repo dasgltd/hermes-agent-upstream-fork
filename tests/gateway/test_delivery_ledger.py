@@ -388,7 +388,10 @@ class TestGatewayRedeliverySweep:
         assert n == 1
         sent = adapter.send.call_args.kwargs
         assert sent["content"] == "the final answer"  # no marker
-        assert sent["metadata"] == {"thread_id": "171.001"}
+        # "plain" is about the CONTENT (no recovery marker), not the metadata: every
+        # redelivery declares itself the turn's final response, or the adapters skip the
+        # rich closing-block renderer and the colored boxes come back as raw markdown.
+        assert sent["metadata"] == {"notify": True, "thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
