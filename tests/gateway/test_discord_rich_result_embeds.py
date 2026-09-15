@@ -394,3 +394,75 @@ async def test_oversized_block_only_payload_still_ships_as_embeds():
     assert len(sends) == 1  # one message, not a length split
     assert not (sends[0].get("content") or "")
     assert [_color(e) for e in sends[0]["embeds"]] == [RESULT_COLOR, RECAP_COLOR]
+
+
+# --- A raw-text lane must never cut a colored box in half (2026-09-15) -------------
+# Symptom Daniel reported twice: the finished boxes on screen, and right under them a
+# standalone message with the SECOND HALF of the same closing block as raw markdown.
+# Cause: every raw lane split on size alone, so a box that started before the 2,000 cap
+# was cut mid-box; the orphaned half survived the finalize that re-rendered the whole
+# payload as embeds.
+
+def _oversized_reply():
+    """A reply whose closing block STARTS before the 2,000 cap and ENDS after it.
+
+    That is the shape the size-only split cut in half; a head that pushes the whole
+    block past the cap is cut on the boundary by luck, and proves nothing.
+    """
+    block = "\n".join(
+        ["------", "", "\u2705 **the box works**", "",
+         "- **TL;DR** \u2014 the colored box is an embed.", "", "**Feito:**"]
+        + [f"- {n}. recap step {n} " + "y" * 60
+           for n in ("i", "ii", "iii", "iv", "v", "vi", "vii")]
+        + ["", "\u26a0\ufe0f **one caveat:** it needs its own box " + "z" * 120, "",
+           "------", "", HANDOFF + " **SUA VEZ (nada me bloqueia)**:",
+           "1. ship it? \u2192 **a)** yes \u00b7 **b)** no"])
+    head_budget = 2000 - len(block) // 2          # the cap lands mid-block
+    head = ""
+    i = 0
+    while len(head) < head_budget:
+        head += f"**Thinking...**\n> checkpoint number {i} " + "x" * 80 + "\n\n"
+        i += 1
+    return head[:head_budget] + "\n\n" + block
+
+
+OVERSIZED = _oversized_reply()
+
+
+def _tail_half_markers(chunk):
+    """The handoff and the caveat belong to the SAME chunk as the result box."""
+    return ("✅ **the box works**" in chunk, "⚠️ **one caveat:**" in chunk,
+            HANDOFF + " **SUA VEZ" in chunk)
+
+
+def test_raw_split_keeps_the_closing_block_whole():
+    adapter = _make_adapter()
+    chunks = adapter._block_safe_chunks(OVERSIZED)
+
+    assert len(chunks) > 1, "the fixture must actually overflow"
+    # Exactly one chunk owns the closing block, and it owns ALL of it.
+    owners = [c for c in chunks if any(_tail_half_markers(c))]
+    assert len(owners) == 1
+    assert all(_tail_half_markers(owners[0])), "the box was cut in half across messages"
+    assert owners[0] is chunks[-1]
+
+
+def test_raw_split_of_a_plain_reply_is_unchanged():
+    adapter = _make_adapter()
+    plain = "line of prose that goes on\n" * 200
+    assert adapter._block_safe_chunks(plain) == adapter._cap_split_chunks(
+        adapter.truncate_message(adapter.format_message(plain), adapter.MAX_MESSAGE_LENGTH))
+
+
+@pytest.mark.asyncio
+async def test_overflow_continuation_never_ships_half_a_box():
+    """``_edit_overflow_split`` is the lane that stranded the orphan half."""
+    adapter = _make_adapter()
+    channel, msg, sends, edits = _wire(adapter)
+
+    result = await adapter._edit_overflow_split(channel, msg, "42", OVERSIZED)
+
+    assert result.success
+    delivered = [_edited_content(edits[:1])] + [c.get("content", "") for c in sends]
+    owners = [c for c in delivered if any(_tail_half_markers(c))]
+    assert len(owners) == 1 and all(_tail_half_markers(owners[0]))

@@ -2900,6 +2900,40 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         kept.append(notice)
         return kept
 
+    def _block_safe_chunks(self, content: str) -> List[str]:
+        """Split an oversized payload for RAW text delivery without ever cutting a colored
+        closing block in half.
+
+        ``truncate_message`` splits on size alone. Every raw-text lane used it, so a payload
+        whose closing blocks start before the cap was cut mid-box: the first half went out
+        with the head and the SECOND half became a standalone message of raw markdown. When a
+        later finalize re-rendered the whole payload as embeds on the first message, that
+        second half stayed on screen underneath the finished boxes - the duplicated tail
+        Daniel reported on 2026-09-14 and again on 2026-09-15.
+
+        ``preferred_final_chunks`` is the hook the stream consumer already uses for exactly
+        this: it chunks the head normally and keeps the closing blocks whole as the last
+        chunk. Fails open to the plain split on any error.
+        """
+        formatted = self.format_message(content)
+        try:
+            preferred = self.preferred_final_chunks(formatted, self.MAX_MESSAGE_LENGTH)
+        except Exception:  # pragma: no cover - never break delivery over styling
+            logger.warning(
+                "[%s] Block-safe chunking failed; falling back to the plain split",
+                self.name, exc_info=True)
+            preferred = None
+        if preferred:
+            chunks: List[str] = []
+            for part in preferred:
+                # The closing-block chunk carries its own (far larger) embed budget, but on a
+                # RAW lane it still has to fit a text message - split it only if it must.
+                chunks.extend(self.truncate_message(part, self.MAX_MESSAGE_LENGTH)
+                              if len(part) > self.MAX_MESSAGE_LENGTH else [part])
+            return self._cap_split_chunks(chunks)
+        return self._cap_split_chunks(
+            self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
+
     async def send(
         self,
         chat_id: str,
@@ -2955,10 +2989,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             reference=self._reply_reference_for_send(reply_to, channel))
                         return await self._record_response_async(
                             reply_to, result, full_content, final_delivery)
-            formatted = self.format_message(content)
-            chunks = self._cap_split_chunks(
-                self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-            )
+            chunks = self._block_safe_chunks(content)
             message_ids = []
             reference = self._reply_reference_for_send(reply_to, channel)
             for i, chunk in enumerate(chunks):
@@ -3439,7 +3470,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         A continuation failure still reports success plus ``partial_overflow`` so the consumer
         delivers the tail; only a first-chunk edit failure returns ``success=False``."""
         formatted = self.format_message(content)
-        chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
+        chunks = self._block_safe_chunks(content)
         if len(chunks) <= 1:
             # Defensive: pre-flight should guarantee >1 chunk; otherwise edit normally.
             await self._edit_stream_message(msg, chunks[0] if chunks else formatted)
