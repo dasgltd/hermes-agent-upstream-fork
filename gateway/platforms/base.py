@@ -583,26 +583,60 @@ def _looks_like_image(data: bytes) -> bool:
                or (data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP"))
 
 
-def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes) -> str:
-    """Write ``data`` to ``<cache_dir>/<prefix>_<uuid12><ext>``; return the path string."""
-    filepath = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
+def _safe_original_stem(original_name: Optional[str], *, max_len: int = 64) -> str:
+    """Sanitized stem of an inbound attachment name, or ``""`` when unusable.
+
+    Screenshot filenames carry the capture timestamp ("Screenshot 2026-09-15 at
+    11.12.26.png"), which is the ONLY chronological signal that survives the trip
+    through Discord: the CDN strips EXIF ``DateTime`` and XMP keeps no date. Losing
+    the name means losing the order the user captured the shots in.
+    """
+    if not original_name:
+        return ""
+    stem = Path(str(original_name)).stem.replace("\x00", "").strip()
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._")
+    stem = re.sub(r"-{2,}", "-", stem)
+    if stem in {"", ".", ".."}:
+        return ""
+    return stem[:max_len]
+
+
+def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes,
+                      original_name: Optional[str] = None) -> str:
+    """Write ``data`` to ``<cache_dir>/<prefix>_<uuid12>[_<original stem>]<ext>``.
+
+    Mirrors ``cache_document_from_bytes``, which has always preserved the inbound
+    name; images used to drop it, so a screenshot's capture timestamp never reached
+    the agent. The uuid stays first so the name is still unique and sortable by call.
+    """
+    stem = _safe_original_stem(original_name)
+    suffix = f"_{stem}" if stem else ""
+    filepath = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{suffix}{ext}"
+    if not filepath.resolve().is_relative_to(cache_dir.resolve()):
+        raise ValueError(f"Path traversal rejected: {original_name!r}")
     filepath.write_bytes(data)
     return str(filepath)
 
 
-def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
+def cache_image_from_bytes(data: bytes, ext: str = ".jpg",
+                           original_name: Optional[str] = None) -> str:
     """Save raw image bytes to the cache and return the absolute path; raises
-    ValueError when *data* isn't an image (e.g. an upstream HTML error page)."""
+    ValueError when *data* isn't an image (e.g. an upstream HTML error page).
+
+    ``original_name`` (the inbound attachment filename) is preserved in the cache
+    file name so screenshot capture timestamps survive into the agent transcript.
+    """
     validate_inbound_media_size(len(data), media_type="image")
     if not _looks_like_image(data):
         snippet = data[:80].decode("utf-8", errors="replace")
         raise ValueError(f"Refusing to cache non-image data as {ext} (starts with: {snippet!r})")
-    return _write_cache_file(get_image_cache_dir(), "img", ext, data)
+    return _write_cache_file(get_image_cache_dir(), "img", ext, data, original_name)
 
 
-async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg") -> str:
+async def cache_image_from_bytes_async(data: bytes, ext: str = ".jpg",
+                                       original_name: Optional[str] = None) -> str:
     """Cache image bytes without blocking the caller's event loop."""
-    return await asyncio.to_thread(cache_image_from_bytes, data, ext)
+    return await asyncio.to_thread(cache_image_from_bytes, data, ext, original_name)
 
 
 async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type: str, accept: str,
@@ -635,11 +669,15 @@ async def _cache_media_from_url(url: str, ext: str, retries: int, *, media_type:
                 raise
 
 
-async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) -> str:
+async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2,
+                               original_name: Optional[str] = None) -> str:
     """Download an image URL into the image cache; return the absolute path."""
+    def _cache_fn(content: bytes, _ext: str) -> str:
+        return cache_image_from_bytes(content, _ext, original_name)
+
     return await _cache_media_from_url(
         url, ext, retries, media_type="image", accept="image/*,*/*;q=0.8",
-        cache_fn=cache_image_from_bytes, log_label="Media")
+        cache_fn=_cache_fn, log_label="Media")
 
 
 def _cleanup_cache_dir(cache_dir: Path, max_age_hours: int) -> int:

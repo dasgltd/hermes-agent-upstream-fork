@@ -5885,17 +5885,24 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return raw_bytes
 
     async def _cache_discord_image(self, att, ext: str) -> str:
-        """Cache an image attachment locally: ``att.read()`` first, SSRF-gated URL fallback."""
+        """Cache an image attachment locally: ``att.read()`` first, SSRF-gated URL fallback.
+
+        The inbound filename travels with the bytes: screenshot names carry the capture
+        timestamp, and Discord strips EXIF, so the name is the only chronological signal
+        left for ordering a batch of screenshots.
+        """
+        original_name = getattr(att, "filename", None)
         raw_bytes = await self._read_attachment_bytes(att, media_type="image")
         if raw_bytes is not None:
             try:
-                return await cache_image_from_bytes_async(raw_bytes, ext=ext)
+                return await cache_image_from_bytes_async(raw_bytes, ext=ext,
+                                                          original_name=original_name)
             except Exception as e:
                 logger.debug(
                     "[Discord] cache_image_from_bytes rejected att.read() data; falling back to URL: %s",
                     e,
                 )
-        return await cache_image_from_url(att.url, ext=ext)
+        return await cache_image_from_url(att.url, ext=ext, original_name=original_name)
 
     async def _cache_discord_audio(self, att, ext: str) -> str:
         """Cache an audio attachment locally: ``att.read()`` first, SSRF-gated URL fallback."""
