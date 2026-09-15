@@ -11,6 +11,7 @@ import pytest
 
 from agent.auxiliary_client import (
     _NOUS_MODEL,
+    _client_cache_key,
     CodexAuxiliaryClient,
     get_text_auxiliary_client,
     get_available_vision_backends,
@@ -2862,7 +2863,14 @@ class TestAuxiliaryAuthRefreshRetry:
 
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
-        cache_key = ("anthropic", False, None, None, None)
+        # Key built by the production key builder, NOT hand-written: _client_cache_key()
+        # puts the profile home at index 0 and the provider at index 1, and the old
+        # hand-made 5-tuple ("anthropic", False, None, None, None) agreed with the eviction bug
+        # instead of catching it (it read key[0]). See traps 16-17 in hermes-safe-update.
+        cache_key = _client_cache_key(
+            "anthropic", async_mode=False, base_url=None, api_key=None, api_mode=None,
+            main_runtime=None, is_vision=False, task=None, model=None,
+        )
 
         monkeypatch.setenv("ANTHROPIC_TOKEN", "")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
@@ -2903,7 +2911,14 @@ class TestAuxiliaryAuthRefreshRetry:
         through to the final `return False` and the stale client (and its
         dead token) stayed cached until process restart."""
         stale_client = MagicMock()
-        cache_key = ("vertex", False, None, None, None)
+        # Key built by the production key builder, NOT hand-written: _client_cache_key()
+        # puts the profile home at index 0 and the provider at index 1, and the old
+        # hand-made 5-tuple ("vertex", False, None, None, None) agreed with the eviction bug
+        # instead of catching it (it read key[0]). See traps 16-17 in hermes-safe-update.
+        cache_key = _client_cache_key(
+            "vertex", async_mode=False, base_url=None, api_key=None, api_mode=None,
+            main_runtime=None, is_vision=False, task=None, model=None,
+        )
 
         with (
             patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "google/gemini-3-flash-preview", None)}),
