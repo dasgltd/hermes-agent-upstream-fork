@@ -3297,10 +3297,21 @@ def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> boo
 
 
 def _evict_cached_clients(provider: str) -> None:
-    """Drop cached auxiliary clients for a provider so fresh creds are used."""
+    """Drop cached auxiliary clients for a provider so fresh creds are used.
+
+    The provider lives at ``_CACHE_KEY_PROVIDER_INDEX`` of the tuple built by
+    ``_client_cache_key``; ``key[0]`` is the profile home. Reading ``key[0]`` here made the
+    eviction a silent no-op for every OAuth-backed provider: the credential refresh succeeded,
+    the stale client stayed cached, and the retry replayed the same expired bearer. A ~1h Vertex
+    token then 401s (``ACCESS_TOKEN_TYPE_UNSUPPORTED``) for the whole process lifetime.
+    """
     normalized = _normalize_aux_provider(provider)
     with _client_cache_lock:
-        for key in [key for key in _client_cache if _normalize_aux_provider(str(key[0])) == normalized]:
+        for key in [
+            key for key in _client_cache
+            if len(key) > _CACHE_KEY_PROVIDER_INDEX
+            and _normalize_aux_provider(str(key[_CACHE_KEY_PROVIDER_INDEX])) == normalized
+        ]:
             client = _client_cache.get(key, (None, None, None))[0]
             if client is not None:
                 _close_cached_client(client)
@@ -5366,6 +5377,9 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
 _client_cache: Dict[tuple, tuple] = {}
 _client_cache_lock = threading.Lock()
 _CLIENT_CACHE_MAX_SIZE = 64  # safety belt — evict oldest when exceeded
+# Position of the provider inside a ``_client_cache_key`` tuple. ``key[0]`` is the profile home,
+# so provider-scoped eviction MUST read this index. Pinned by a test that rebuilds a real key.
+_CACHE_KEY_PROVIDER_INDEX = 1
 
 
 class _CallableCacheDiscriminator:
@@ -6937,6 +6951,22 @@ _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
 )
 
 
+def _task_has_configured_fallback_chain(task: Optional[str]) -> bool:
+    """True when ``auxiliary.<task>.fallback_chain`` declares at least one candidate.
+
+    Configuring a chain is an explicit statement that this task may leave its primary provider.
+    Used to let an auth failure reach that chain even when the provider was named explicitly.
+    Never raises: a config read failure answers False and keeps the old, stricter behaviour.
+    """
+    if not task:
+        return False
+    try:
+        chain = _get_auxiliary_task_config(task).get("fallback_chain")
+    except Exception:
+        return False
+    return isinstance(chain, list) and any(isinstance(entry, dict) and entry for entry in chain)
+
+
 def _rung(step: "_LadderStep", accept: Callable[[Exception], bool]):
     """One ladder rung: perform ``step``; yields ``(response, None)`` on success,
     ``(None, exc)`` when ``accept(exc)`` lets the next rung handle it, else re-raises."""
@@ -7173,7 +7203,15 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
     is_capacity_error = any(
         predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
-    if reason is None or not (is_auto or is_capacity_error):
+    # An explicit provider normally keeps auth errors to itself (the user picked that backend).
+    # But a task that declares its own ``fallback_chain`` has already stated the opposite intent:
+    # "when this provider cannot answer, use these". Refusing to walk it turned a single expired
+    # bearer into a total outage of the task -- compression fell back to the deterministic
+    # summarizer for hours while two configured spares sat unused (telemetry: fallback_used=false).
+    # Scope is deliberately narrow: ONLY the task's own configured chain, never the discovery
+    # chain or the main-agent-model net, which the user never opted into for this task.
+    auth_chain_allowed = reason == "auth error" and _task_has_configured_fallback_chain(task)
+    if reason is None or not (is_auto or is_capacity_error or auth_chain_allowed):
         return None
     if reason == "payment error":
         # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip
@@ -7204,7 +7242,9 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
                 failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None:
+    elif fb_client is None and not auth_chain_allowed:
+        # auth_chain_allowed widened the gate for the task's OWN chain only; an explicit provider
+        # must not silently spill a 401 onto the main agent model.
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
