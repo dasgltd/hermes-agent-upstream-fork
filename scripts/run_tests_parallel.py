@@ -952,7 +952,24 @@ def main() -> int:
             return True
         return False
 
+    def _argv_before_sep(tokens: List[str]) -> List[str]:
+        """Tokens the runner itself owns: everything before an explicit ``--``.
+
+        After ``--`` the developer asked for verbatim pytest passthrough, so a
+        ``--help`` there is theirs to own; before it, it is a usage request.
+        """
+        return tokens[: tokens.index("--")] if "--" in tokens else list(tokens)
+
     argv = sys.argv[1:]
+    # ``-h``/``--help`` are NOT pytest passthrough. Bare-flag routing (below)
+    # forwards any unknown ``-``-token to the per-file pytest, so ``--help``
+    # used to skip argparse entirely and launch a FULL discovery run: 4218
+    # files x ``pytest --help``, which exits 0 per file, i.e. a ~2h accidental
+    # sweep that reports no tests ran. Asking for usage must never start a run.
+    if any(tok in ("-h", "--help") for tok in _argv_before_sep(argv)):
+        parser.print_help()
+        return 0
+
     if "--" in argv:
         sep = argv.index("--")
         before, explicit_passthrough = argv[:sep], argv[sep + 1 :]
