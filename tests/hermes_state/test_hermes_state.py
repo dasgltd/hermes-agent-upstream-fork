@@ -1043,12 +1043,28 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        traced_connections = []
+
+        def _trace(conn):
+            """Attach the tracer to every connection the read path actually hands out.
+
+            The previous version pre-opened ONE read connection via _get_read_conn()
+            and traced that object. _get_read_conn() opens a FRESH connection and does
+            not enqueue it, so the pool was still empty when search_messages() ran:
+            _read_ctx() -> _checkout_read_conn() -> queue.Empty -> _get_read_conn()
+            opened a THIRD connection, untraced, and every statement counted zero.
+            Hooking the checkout instead traces whichever connection is really used,
+            pooled or freshly opened, and still covers the non-WAL degraded path where
+            _read_ctx() falls back to the writer connection.
+            """
+            if conn is not None and all(conn is not seen for seen in traced_connections):
+                traced_connections.append(conn)
+                conn.set_trace_callback(statements.append)
+            return conn
+
+        _trace(db._conn)
+        original_checkout = db._checkout_read_conn
+        db._checkout_read_conn = lambda: _trace(original_checkout())
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -1073,6 +1089,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
+            db._checkout_read_conn = original_checkout
             for conn in traced_connections:
                 conn.set_trace_callback(None)
 
