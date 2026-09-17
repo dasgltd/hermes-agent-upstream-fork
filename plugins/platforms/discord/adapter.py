@@ -3318,11 +3318,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         Discord accepts up to 10 embeds per message and the closing shape never produces
         more than three (result, recap, handoff), so one message carries them all and the
         consumer still gets a real message id back to track."""
+        target_id = getattr(channel, "id", "")
+        allowed, prev_id = self._claim_rich_blocks(target_id, blocks, "send-embed-only")
+        if not allowed and prev_id:
+            # Another lane already published these boxes; hand back ITS message id so
+            # the consumer keeps a real edit target instead of entering fallback mode.
+            return SendResult(success=True, message_id=str(prev_id),
+                              raw_response={"message_ids": [str(prev_id)],
+                                            "deduplicated": True})
         embeds = [self._build_rich_embed(block) for block in blocks]
         try:
             msg = await channel.send(content=None, embeds=embeds, reference=reference)
         except Exception:
             msg = await channel.send(content=None, embeds=embeds)
+        self._record_rich_blocks_message(target_id, blocks, getattr(msg, "id", None))
         return SendResult(success=True, message_id=str(msg.id),
                           raw_response={"message_ids": [str(msg.id)]})
 
@@ -3387,6 +3396,68 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 self.name, exc_info=True)
             return None
 
+    # Two INDEPENDENT lanes can publish the same closing blocks for one turn: the
+    # consumer's split lane sends them as an embed-only message, and the turn-final
+    # edit republishes them as the rich tail of ``edit_message(finalize=True)``.
+    # Measured 2026-09-17 in Discord thread 1532149266271703241 - messages
+    # 1550226868643438683 (19:28:07.307) and 1550226871101169756 (19:28:07.893)
+    # carried BYTE-IDENTICAL embeds 586ms apart, with the head edit landing between
+    # them at 19:28:07.539. Neither lane can see the other, and a per-call guard is
+    # therefore blind; the claim lives on the ADAPTER, the one choke point both
+    # lanes pass through. 586ms also rules out a discord.py transport retry, which
+    # sleeps at least 1s before its first retry.
+    _RICH_BLOCK_CLAIM_TTL = 90.0
+    _RICH_BLOCK_CLAIM_MAX = 64
+
+    @staticmethod
+    def _rich_block_digest(blocks: List[Any]) -> str:
+        """Stable fingerprint of a closing-block payload (RichBlock is a dataclass)."""
+        payload = "\x1e".join(repr(block) for block in blocks)
+        return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+    def _claim_rich_blocks(self, target_id: Any, blocks: List[Any], lane: str):
+        """Claim the right to publish ``blocks`` into ``target_id``.
+
+        ``(True, None)`` for a first publication; ``(False, <message id or None>)``
+        when the same payload was published moments ago by another lane. Fail-open by
+        design: an unknown prior id still returns False, and callers that need a real
+        message id decide for themselves whether to publish anyway."""
+        now = time.monotonic()
+        claims = getattr(self, "_rich_block_claims", None)
+        if claims is None:
+            claims = {}
+            self._rich_block_claims = claims
+        for key, entry in list(claims.items()):
+            if now - entry[0] > self._RICH_BLOCK_CLAIM_TTL:
+                claims.pop(key, None)
+        key = (str(target_id), self._rich_block_digest(blocks))
+        prev = claims.get(key)
+        if prev is not None:
+            logger.warning(
+                "[%s] Duplicate closing-block publication suppressed in %s: lane=%s, "
+                "already published by lane=%s %.3fs ago (message %s)",
+                self.name, target_id, lane, prev[2], now - prev[0], prev[1],
+            )
+            return False, prev[1]
+        claims[key] = (now, None, lane)
+        while len(claims) > self._RICH_BLOCK_CLAIM_MAX:
+            claims.pop(min(claims, key=lambda k: claims[k][0]), None)
+        logger.info("[%s] Publishing %d closing block(s) to %s via lane=%s",
+                    self.name, len(blocks), target_id, lane)
+        return True, None
+
+    def _record_rich_blocks_message(self, target_id: Any, blocks: List[Any],
+                                    message_id: Any) -> None:
+        """Attach the delivered message id to an existing claim, so a later lane that
+        is suppressed can still hand its caller a real id."""
+        claims = getattr(self, "_rich_block_claims", None)
+        if not claims or not message_id:
+            return
+        key = (str(target_id), self._rich_block_digest(blocks))
+        entry = claims.get(key)
+        if entry is not None:
+            claims[key] = (entry[0], str(message_id), entry[2])
+
     async def _send_rich_blocks(
         self, chat_id: str, blocks: List[Any], metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -3394,12 +3465,22 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         already succeeded, so a failure here is logged and swallowed: a missing box is cosmetic, a
         raised exception would look like a failed turn."""
         try:
-            channel = await self._resolve_channel((metadata or {}).get("thread_id") or chat_id)
+            target_id = (metadata or {}).get("thread_id") or chat_id
+            channel = await self._resolve_channel(target_id)
             if not channel:
                 return
+            allowed, _prev_id = self._claim_rich_blocks(target_id, blocks, "edit-finalize-tail")
+            if not allowed:
+                # The other lane already put these boxes on screen. This lane returns
+                # nothing to its caller, so dropping it is free.
+                return
+            first_id = None
             for block in blocks:
                 # No suppress_embeds here: that flag hides rich embeds too.
-                await channel.send(embed=self._build_rich_embed(block))
+                msg = await channel.send(embed=self._build_rich_embed(block))
+                if first_id is None:
+                    first_id = getattr(msg, "id", None)
+            self._record_rich_blocks_message(target_id, blocks, first_id)
         except Exception:
             logger.warning(
                 "[%s] Failed to deliver rich closing blocks to %s", self.name, chat_id, exc_info=True)
