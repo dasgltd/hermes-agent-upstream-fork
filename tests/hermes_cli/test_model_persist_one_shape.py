@@ -21,7 +21,7 @@ _SEED = (
     "model:\n"
     "  default: local-model\n"
     "  provider: custom\n"
-    "  base_url: http://localhost:1234/v1\n"
+    "  base_url: http://box.lan:1234/v1\n"
     "  api_mode: anthropic_messages\n"
     "  api_key: sk-stale\n"
     "  context_length: 32000\n"
@@ -106,7 +106,7 @@ def test_same_route_repick_keeps_the_context_pin(seeded_home):
     from hermes_cli.model_switch import persist_model_selection
     same_route = ModelSwitchResult(
         success=True, new_model="local-model", target_provider="custom",
-        base_url="http://localhost:1234/v1", api_mode="anthropic_messages", is_global=True)
+        base_url="http://box.lan:1234/v1", api_mode="anthropic_messages", is_global=True)
     persist_model_selection(same_route)
     block = _model_block(seeded_home)
     assert block["context_length"] == 32000
@@ -145,7 +145,7 @@ def test_provider_switch_drops_the_key_env_pointer_but_a_same_route_repick_keeps
     (seeded_home / "config.yaml").write_text(seed, encoding="utf-8")
     same_route = ModelSwitchResult(
         success=True, new_model="local-model", target_provider="custom",
-        base_url="http://localhost:1234/v1", api_mode="anthropic_messages", is_global=True)
+        base_url="http://box.lan:1234/v1", api_mode="anthropic_messages", is_global=True)
     persist_model_selection(same_route)
     assert _model_block(seeded_home)["key_env"] == "CUSTOM_BOX_API_KEY"
 
@@ -156,7 +156,7 @@ def test_provider_switch_drops_the_key_env_pointer_but_a_same_route_repick_keeps
             .replace("CUSTOM_BOX_API_KEY", "HERMES_CUSTOM_LMSTUDIO_API_KEY"), encoding="utf-8")
     persist_model_selection(ModelSwitchResult(
         success=True, new_model="qwen3-8b", target_provider="lmstudio",
-        base_url="http://localhost:1234/v1", api_mode="openai_chat", is_global=True))
+        base_url="http://box.lan:1234/v1", api_mode="openai_chat", is_global=True))
     block = _model_block(seeded_home)
     assert block["default"] == "qwen3-8b"
     assert block["key_env"] == "HERMES_CUSTOM_LMSTUDIO_API_KEY"
@@ -174,3 +174,51 @@ def test_gateway_persists_to_the_profile_config_it_was_given(tmp_path, monkeypat
     asyncio.run(_persist_model_switch_to_config(_RESULT, profile_home / "config.yaml"))
     assert _model_block(profile_home)["default"] == "claude-haiku"
     assert _model_block(process_home)["default"] == "old"
+
+
+# --- DASG carried patch coverage -------------------------------------------
+# The seed endpoint above is deliberately a REMOTE host. A LOOPBACK endpoint is the one
+# case where this machine must NOT behave like stock Hermes: hermes_cli/model_switch.py
+# carries a local patch (2026-07-17, re-derived 2026-09-14) that keeps a loopback
+# base_url when the switch target is anthropic and the resolver returned no endpoint of
+# its own. Rationale: model.base_url points at the local claude-proxy
+# (http://127.0.0.1:11435) which serves Claude through the Max subscription. Clearing it
+# on a /model switch to a native Anthropic model reroutes every Claude turn straight to
+# api.anthropic.com, where the placeholder key 401s and the session falls over to the
+# Codex fallback - a silent, expensive regression with no error the user can read.
+#
+# Upstream is right for stock installs (a stale endpoint must not linger) and this host is
+# right for ours; the two only ever disagree on loopback. These tests pin BOTH sides, so
+# the exception stays visible instead of looking like an unexplained red test at 02:30.
+
+
+@pytest.mark.parametrize("loopback", ["http://127.0.0.1:11435", "http://localhost:11435"])
+def test_anthropic_switch_keeps_a_loopback_proxy_endpoint(seeded_home, loopback):
+    """DASG carry: loopback + anthropic target + no resolved endpoint -> the endpoint stays."""
+    from hermes_cli.model_switch import persist_model_selection
+    (seeded_home / "config.yaml").write_text(
+        _SEED.replace("http://box.lan:1234/v1", loopback), encoding="utf-8")
+    persist_model_selection(_RESULT)
+    block = _model_block(seeded_home)
+    assert block["provider"] == "anthropic" and block["default"] == "claude-haiku"
+    assert block["base_url"] == loopback, "the local claude-proxy endpoint must survive"
+    # Everything else still clears exactly as upstream demands - the carry is endpoint-only.
+    assert "api_mode" not in block and "api_key" not in block
+
+
+def test_a_loopback_endpoint_is_still_cleared_for_any_other_provider(seeded_home):
+    """The carry is anthropic-only: no other provider may inherit the local proxy URL."""
+    from hermes_cli.model_switch import persist_model_selection
+    (seeded_home / "config.yaml").write_text(
+        _SEED.replace("http://box.lan:1234/v1", "http://127.0.0.1:11435"), encoding="utf-8")
+    persist_model_selection(ModelSwitchResult(
+        success=True, new_model="gpt-5", target_provider="openai", provider_changed=True,
+        base_url="", api_mode="", is_global=True))
+    assert "base_url" not in _model_block(seeded_home)
+
+
+def test_an_anthropic_switch_still_clears_a_remote_endpoint(seeded_home):
+    """Upstream's own rule, unchanged: a REMOTE stale endpoint is dropped on the switch."""
+    from hermes_cli.model_switch import persist_model_selection
+    persist_model_selection(_RESULT)
+    assert "base_url" not in _model_block(seeded_home)
