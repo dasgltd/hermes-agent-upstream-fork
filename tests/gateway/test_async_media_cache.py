@@ -11,7 +11,7 @@ import gateway.platforms.base as base
 @pytest.mark.parametrize(
     ("async_name", "sync_name", "args", "forwarded"),
     [
-        # The image wrapper also forwards ``original_name`` (None when the caller omits it),
+        # The image wrapper also forwards ``filename`` (None when the caller omits it),
         # so the sync callee sees three positional args, not two.
         (
             "cache_image_from_bytes_async",
@@ -73,7 +73,7 @@ async def test_async_cache_wrappers_keep_event_loop_responsive(
 
 @pytest.mark.asyncio
 async def test_async_cache_wrapper_propagates_validation_errors(monkeypatch):
-    def reject_image(data, ext, original_name=None):
+    def reject_image(data, ext, filename=None):
         raise ValueError("invalid image")
 
     monkeypatch.setattr(base, "cache_image_from_bytes", reject_image)
