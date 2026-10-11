@@ -246,6 +246,58 @@ async def test_status_command_prefers_rehydrated_session_model_override(tmp_path
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_cold_model_switch_refreshes_session_billing_route(tmp_path):
+    """A /model switch with no resident agent must still move the stored billing route.
+
+    agent.switch_model() is the only other writer; without it the session row keeps the first
+    route and the dashboard shows the new model next to the old provider.
+    """
+    source = _make_source()
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    session_entry = store.get_or_create_session(source)
+    runner = _make_runner(session_entry)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner._session_db = AsyncSessionDB(db)
+    try:
+        db.create_session(session_entry.session_id, "telegram", model="model-a")
+        db.update_token_counts(
+            session_entry.session_id,
+            model="model-a",
+            billing_provider="provider-a",
+            billing_base_url="https://a.example/v1",
+            input_tokens=10,
+            api_call_count=1,
+        )
+        result = SimpleNamespace(
+            new_model="model-b",
+            target_provider="provider-b",
+            provider_label="Provider B",
+            api_key="secret",
+            base_url="https://b.example/v1",
+            api_mode="chat_completions",
+            request_overrides={},
+            runtime_capabilities={},
+        )
+        switch_ctx = SimpleNamespace(
+            session_key=session_entry.session_key,
+            current_model="model-a",
+            persist_global=False,
+            restore_snapshot=None,
+        )
+        await runner._record_model_switch(
+            result, switch_ctx, source=source, one_turn=False, picker=False
+        )
+
+        row = db.get_session(session_entry.session_id)
+        assert row["billing_provider"] == "provider-b"
+        assert row["billing_base_url"] == "https://b.example/v1"
+    finally:
+        db.close()
+
+
 def _runner_with_session_override(override: dict, *, last_prompt_tokens: int):
     """Runner whose session has a committed /model override but no resident agent (no compressor)."""
     session_entry = SessionEntry(

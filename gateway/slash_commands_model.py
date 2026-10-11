@@ -233,6 +233,14 @@ class GatewayModelCommandsMixin:
                     _sess_entry.session_id, result.new_model, provider=result.target_provider,
                     base_url=result.base_url, api_mode=result.api_mode,
                 )
+                # agent.switch_model() is the only other writer of the billing route and runs
+                # only when a cached agent exists. On a cold switch (an idle session picked back
+                # up) it never runs, so billing_provider/base_url stay at the session's first
+                # route and the dashboard and /status show the new model next to the old provider.
+                await _sess_db.update_session_billing_route(
+                    _sess_entry.session_id, provider=result.target_provider,
+                    base_url=result.base_url, billing_mode=result.api_mode,
+                )
             except Exception as exc:
                 logger.debug("Failed to persist model switch to DB: %s", exc)
         # Prepended to the next user message (no system messages mid-history). Display form strips
