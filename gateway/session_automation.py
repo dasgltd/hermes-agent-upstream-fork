@@ -234,18 +234,28 @@ def restore_local_automation(authority, ref, row):
 
 async def admit_automation(authority, adapter, event, identity):
     authority._require_admission_open()
-    payload, entry = snapshot_automation(authority, adapter, event, identity)
     from gateway.session_authority import LiveSession
-    sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
-    ref = SessionRef(authority.profile_id, sid)
-    authority.sessions.setdefault(ref.session_id, LiveSession(event.source, entry.session_key))
-    from functools import partial
     from gateway.session_runtime_workers import tracked_write
-    return await tracked_write(authority, partial(
-        admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
-        session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate()), then=partial(authority._admitted, ref, event), ordered=True,
-        after=partial(authority._schedule_admitted, ref))
+
+    def write():
+        # Keep snapshot reads and commit in the same ordered worker. Offloading only the
+        # snapshot would let a later producer overtake a slow earlier one in the FIFO.
+        payload, entry = snapshot_automation(authority, adapter, event, identity)
+        sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
+        row = admit_session_input(
+            authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
+            session_id=sid, request_id=identity, payload=deepcopy(payload),
+            _authorize_write=authority._admission_gate())
+        return row, sid, entry.session_key
+
+    def admitted(result):
+        row, sid, route = result
+        ref = SessionRef(authority.profile_id, sid)
+        authority.sessions.setdefault(sid, LiveSession(event.source, route))
+        return authority._admitted(ref, event, row)
+
+    return await tracked_write(authority, write, then=admitted, ordered=True,
+        after=lambda receipt: authority._schedule_admitted(receipt.ref))
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})

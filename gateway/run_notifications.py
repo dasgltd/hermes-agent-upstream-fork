@@ -1170,7 +1170,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return claim.early_result
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
-                if completion_admission(self, evt) is not None:
+                if await asyncio.to_thread(completion_admission, self, evt) is not None:
                     accepted = True  # Lost ACK: finish durable claims, never infer again.
                     return True
             if identity is not None:
@@ -1265,7 +1265,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission, producer_identity
-                entries_to_deliver = [item for item in entries if completion_admission(self, item[1]) is None]
+                entries_to_deliver = [item for item in entries
+                                      if await asyncio.to_thread(completion_admission, self, item[1]) is None]
                 if not entries_to_deliver:
                     delivered = True
                     return
@@ -1411,7 +1412,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 continue
             if getattr(self, 'session_authority', None) is not None:
                 from gateway.session_automation import completion_admission
-                if completion_admission(self, evt) is not None:
+                if await asyncio.to_thread(completion_admission, self, evt) is not None:
                     acknowledged = await self._deliver_completion_notification(synth_text, evt) is True or acknowledged
                     continue
             parent = str(evt.get("parent_session_id") or "")

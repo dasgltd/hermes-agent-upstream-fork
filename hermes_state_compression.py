@@ -807,23 +807,34 @@ class SessionCompressionMixin:
         can publish between finding the tip and writing it."""
         return _walk_compression_chain(session_id, lambda current: conn.execute(_CHAIN_STEP_SQL, (current,)).fetchone())[-1]
 
-    def _is_compression_child_row(self, child: dict[str, Any]) -> bool:
+    def _is_compression_child_row(self, child: dict[str, Any], *, lookup=None) -> bool:
         parent_id = child.get("parent_session_id")
         # A reset fork of a compression-ended parent is its own conversation, not the continuation (#114271).
         if not parent_id or self._is_explicit_fork_child_row(child, include_reset=True):
             return False
-        parent = self.get_session(parent_id)
+        parent = (lookup or self.get_session)(parent_id)
         return bool(parent and parent.get("end_reason") == "compression")
 
     def get_compression_lineage(self, session_id: str) -> list[str]:
         """Return compression ancestors through tip in chronological order."""
-        session = self.get_session(session_id)
+        # Identity needs metadata, not hydrated system/tool prompts. Cache within this walk
+        # only: compression and resets can change the next walk's ownership boundary.
+        columns = "id, parent_session_id, end_reason, source, model_config"
+        metadata = {}
+
+        def lookup(sid):
+            if sid not in metadata:
+                row = self._read_one(f"SELECT {columns} FROM sessions WHERE id = ?", (sid,))
+                metadata[sid] = dict(row) if row is not None else None
+            return metadata[sid]
+
+        session = lookup(session_id)
         if not session or self._is_explicit_fork_child_row(session):
             return [session_id] if session else []
         root = session
         ancestors = {root["id"]}
-        while self._is_compression_child_row(root):
-            parent = self.get_session(root["parent_session_id"])
+        while self._is_compression_child_row(root, lookup=lookup):
+            parent = lookup(root["parent_session_id"])
             if not parent or parent["id"] in ancestors:
                 break
             root = parent
@@ -833,12 +844,12 @@ class SessionCompressionMixin:
         current = root
         while current.get("end_reason") == "compression":
             rows = self._read_all(
-                """
-                SELECT * FROM sessions
-                WHERE parent_session_id = ?
-                ORDER BY started_at ASC
-                """, (current["id"],))
-            next_child = next((dict(row) for row in rows if self._is_compression_child_row(dict(row))), None)
+                f"SELECT {columns} FROM sessions WHERE parent_session_id = ? ORDER BY started_at ASC",
+                (current["id"],))
+            children = [dict(row) for row in rows]
+            metadata.update((child["id"], child) for child in children)
+            next_child = next((child for child in children
+                               if self._is_compression_child_row(child, lookup=lookup)), None)
             if not next_child or next_child["id"] in seen:
                 break
             lineage.append(next_child["id"])

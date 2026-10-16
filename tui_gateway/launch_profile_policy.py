@@ -154,7 +154,7 @@ def launch_secret_scope(launch_home: str | Path) -> dict[str, str]:
 
 
 @contextlib.contextmanager
-def launch_profile_runtime_scope(launch_home: str | Path) -> Iterator[None]:
+def launch_profile_runtime_scope(launch_home: str | Path, *, _prepared=None) -> Iterator[None]:
     """Bind the launch profile's own runtime scope for one body: HERMES_HOME override naming the
     launch home, ``launch_secret_scope``, and its terminal policy over the frozen launch
     ``TERMINAL_*`` overlay. For hosts whose launch-profile bodies are not RPC sessions (the
@@ -168,14 +168,16 @@ def launch_profile_runtime_scope(launch_home: str | Path) -> Iterator[None]:
     (``gateway/run.py::_profile_runtime_scope``); the launch profile is a tenant like any other."""
     from agent.secret_scope import reset_secret_scope, set_secret_scope
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
+    from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope, set_terminal_scope
 
     home = Path(launch_home)
     home_token = secret_token = terminal_token = None
     try:
         home_token = set_hermes_home_override(str(home))
-        secret_token = set_secret_scope(launch_secret_scope(home))  # own home: no foreign stamp
-        terminal_token = install_profile_terminal_scope(home, env_overlay=launch_terminal_env())
+        secret_token = set_secret_scope(
+            launch_secret_scope(home) if _prepared is None else _prepared[0])  # own home: no foreign stamp
+        terminal_token = (install_profile_terminal_scope(home, env_overlay=launch_terminal_env())
+                          if _prepared is None else set_terminal_scope(_prepared[1]))
         yield
     finally:
         if terminal_token is not None:
@@ -207,7 +209,21 @@ def launch_profile_scope_if_multiplexed():
 
 @contextlib.asynccontextmanager
 async def async_launch_profile_scope_if_multiplexed():
-    """``async with`` twin of :func:`launch_profile_scope_if_multiplexed` (no I/O of its own: the
-    launch scope is rebuilt from already-hydrated sources, so there is nothing to move off-loop)."""
-    with launch_profile_scope_if_multiplexed():
+    """Read file-backed launch policy off-loop, then bind its context on the caller task."""
+    import asyncio
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+    from hermes_constants import get_process_hermes_home
+    from tools.terminal_scope import get_terminal_scope
+
+    if not is_multiplex_active():
+        yield
+        return
+    home = get_process_hermes_home()
+
+    def prepare():
+        with launch_profile_runtime_scope(home):
+            return current_secret_scope(), get_terminal_scope()
+
+    prepared = await asyncio.to_thread(prepare)
+    with launch_profile_runtime_scope(home, _prepared=prepared):
         yield
